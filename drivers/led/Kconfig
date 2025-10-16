@@ -1,0 +1,14 @@
+# Copyright (c) 2025 Blue Vending
+# SPDX-License-Identifier: Apache-2.0
+
+# Status LED driver configuration
+
+config STATUS_LED
+    bool "Status LED Driver"
+    depends on GPIO
+    help
+      Enable support for status LEDs.
+
+if STATUS_LED
+
+endif # STATUS_LED

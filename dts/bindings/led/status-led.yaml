@@ -1,0 +1,13 @@
+description: Status LED driver
+
+compatible: "status-led"
+
+properties:
+  led-gpios:
+    type: phandle-array
+    required: true
+    description: GPIO phandle and specifier for the LED pin
+
+  label:
+    type: string
+    description: Human readable string describing the device

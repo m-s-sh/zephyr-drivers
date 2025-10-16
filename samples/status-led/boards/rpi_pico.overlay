@@ -1,0 +1,20 @@
+/*
+ * Device tree overlay for Status LED Sample on Raspberry Pi Pico
+ * - Maps Green LED to GP2 and Red LED to GP3
+ */
+
+/ {
+    status_led_a: status_led_a {
+        compatible = "status-led";
+        status = "okay";
+        led-gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
+        label = "Status LED A";
+    };
+
+    status_led_b: status_led_b {
+	compatible = "status-led";
+	status = "okay";
+	led-gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
+	label = "Status LED B";
+    };
+};
