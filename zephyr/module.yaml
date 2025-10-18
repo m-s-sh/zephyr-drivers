@@ -1,5 +1,5 @@
-# Copyright (c) 2025 Blue Vending
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 Blue Vending
 
 build:
   kconfig: Kconfig

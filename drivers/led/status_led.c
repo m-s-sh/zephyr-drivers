@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * Copyright (c) 2025 Blue Vending
+ * Status LED driver
  *
- * SPDX-License-Identifier: Apache-2.0
  */
 
 #define DT_DRV_COMPAT status_led

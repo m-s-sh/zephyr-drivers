@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 Blue Vending
 
-rsource "led/Kconfig"
+add_subdirectory_ifdef(CONFIG_MODEM_SIM800L simcom)

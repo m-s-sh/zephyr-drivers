@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 Blue Vending
+
+config MODEM_SIM800L
+    bool "SIM800L Modem Driver"
+    select MODEM_CONTEXT
+    depends on UART
+    help
+      Enable support for SIM800L GSM/GPRS modem.

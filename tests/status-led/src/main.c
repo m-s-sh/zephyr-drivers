@@ -1,4 +1,10 @@
-/**
+/*
+ * Copyright (c) 2025 Blue Vending
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
  * @file status_led_test.c
  * @brief Simple Status LED Test - 5 Second Visual Confirmation
  *

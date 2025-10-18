@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 Blue Vending
+
+name: uart_serial_port
+append:
+  EXTRA_CONF_FILE: uart_serial_port.conf
+  EXTRA_DTC_OVERLAY_FILE: uart_serial_port.overlay
