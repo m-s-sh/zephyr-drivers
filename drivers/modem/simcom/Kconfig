@@ -1,9 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 Blue Vending
 
+# SIM800L modem configuration
 config MODEM_SIM800L
-    bool "SIM800L Modem Driver"
-    select MODEM_CONTEXT
-    depends on UART
-    help
-      Enable support for SIM800L GSM/GPRS modem.
+	bool "SIM800L Modem Driver"
+	select MODEM_MODULES
+	imply GPIO
+	help
+	  Enable support for SIM800L GSM/GPRS modem using modern modem framework.
+
+	  The SIM800L is a GSM/GPRS module that supports:
+	  - Quad-band GSM/GPRS connectivity
+	  - AT command interface via UART
+	  - CMUX multiplexing support
+	  - PPP data connections
+	  - Reset control via GPIO
+
+if MODEM_SIM800L
+
+config MODEM_SIM800L_INIT_PRIORITY
+	int "SIM800L initialization priority"
+	default 80
+	help
+	  SIM800L driver initialization priority.
+
+endif # MODEM_SIM800L

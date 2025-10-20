@@ -6,3 +6,8 @@ description: Simcom Sim800L modem
 compatible: "simcom,sim800l"
 
 include: zephyr,cellular-modem-device.yaml
+
+properties:
+  mdm-reset-gpios:
+    type: phandle-array
+    required: true
