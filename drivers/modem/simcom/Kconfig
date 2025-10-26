@@ -4,7 +4,12 @@
 # SIM800L modem configuration
 config MODEM_SIM800L
 	bool "SIM800L Modem Driver"
-	select MODEM_MODULES
+	select MODEM_CONTEXT
+	select MODEM_CMD_HANDLER
+	select MODEM_IFACE_UART
+	select MODEM_SOCKET
+	select NET_OFFLOAD
+	select NET_SOCKETS_OFFLOAD
 	imply GPIO
 	help
 	  Enable support for SIM800L GSM/GPRS modem using modern modem framework.
