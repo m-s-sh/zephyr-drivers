@@ -9,147 +9,48 @@
 
 #include <zephyr/logging/log.h>
 #include <zephyr/net/offloaded_netdev.h>
-#include <zephyr/net/socket_offload.h>
 #include <zephyr/pm/device.h>
 
-LOG_MODULE_REGISTER(simcom_sim800l, CONFIG_LOG_DEFAULT_LEVEL);
+LOG_MODULE_REGISTER(modem_simcom_sim800l, CONFIG_MODEM_SIM800L_LOG_LEVEL);
 
 #include <string.h>
 #include <stdlib.h>
 
 #include "sim800l.h"
 
-/* SIM800L specific state enum */
-enum sim800l_state {
-	SIM800L_STATE_IDLE = 0,
-	SIM800L_STATE_RESET,
-	SIM800L_STATE_INIT,
-	SIM800L_STATE_READY,
-	SIM800L_STATE_ERROR,
-};
-
-/* Power management and GPIO control */
-struct sim800l_data {
-	/*
-	 * Network interface of the sim module.
-	 */
-	struct net_if *netif;
-	uint8_t mac_addr[6];
-
-	/*
-	 * Uart interface of the modem.
-	 */
-	struct modem_iface_uart_data iface_data;
-	uint8_t iface_rb_buf[MDM_MAX_DATA_LENGTH];
-
-	/*
-	 * Modem socket data.
-	 */
-	struct modem_socket_config socket_config;
-	struct modem_socket sockets[MDM_MAX_SOCKETS];
-
-	/* modem cmds */
-	struct modem_cmd_handler_data cmd_handler_data;
-	uint8_t cmd_match_buf[MDM_RECV_BUF_SIZE + 1];
-
-	/*
-	 * Uart interface of the modem.
-	 */
-	const struct gpio_dt_spec reset_gpio;
-
-	/* DNS related variables */
-	struct {
-		/* Number of DNS retries */
-		uint8_t recount;
-		/* Timeout in milliseconds */
-		uint16_t timeout;
-	} dns;
-
-	/*
-	 * Information over the modem.
-	 */
-	char manufacturer[MDM_MANUFACTURER_LENGTH];
-	char model[MDM_MODEL_LENGTH];
-	char revision[MDM_REVISION_LENGTH];
-	char imei[MDM_IMEI_LENGTH];
-
-	bool powered;
-	struct k_work_delayable timeout_work;
-	enum sim800l_state state;
-	// struct modem_pipe *uart_pipe;
-	// struct modem_cmux cmux;
-	// struct modem_chat chat;
-	struct k_sem sem_tx_ready;
-	struct k_sem sem_response;
-	struct k_sem sem_dns;
-};
-
-struct sim800l_config {
-	const struct device *uart;
-};
-
 static struct k_thread modem_rx_thread;
 static K_KERNEL_STACK_DEFINE(modem_rx_stack, 1028); /* 1024 + 4 sentinel */
 NET_BUF_POOL_DEFINE(mdm_recv_pool, MDM_RECV_MAX_BUF, MDM_RECV_BUF_SIZE, 0, NULL);
 
 /* Device instance definition */
-static struct sim800l_data sim800l_data_0 = {
+struct sim800l_data mdata = {
 	.reset_gpio = GPIO_DT_SPEC_INST_GET_OR(0, mdm_reset_gpios, {}),
 	.powered = false,
 };
 
-static const struct sim800l_config sim800l_config_0 = {
+static const struct sim800l_config mconfig = {
 	.uart = DEVICE_DT_GET(DT_INST_BUS(0)),
 };
 
-static struct modem_context mctx;
-static struct zsock_addrinfo dns_result;
-static struct sockaddr dns_result_addr;
-static char dns_result_canonname[DNS_MAX_NAME_SIZE + 1];
-
-static inline uint32_t hash32(char *str, int len)
-{
-#define HASH_MULTIPLIER 37
-	uint32_t h = 0;
-	int i;
-
-	for (i = 0; i < len; ++i) {
-		h = (h * HASH_MULTIPLIER) + str[i];
-	}
-
-	return h;
-}
-
 MODEM_CMD_DEFINE(on_cmd_ok)
 {
-	struct sim800l_data *drv_data = data->user_data;
-	LOG_DBG("OK received");
 	modem_cmd_handler_set_error(data, 0);
-	k_sem_give(&drv_data->sem_response);
+	k_sem_give(&mdata.sem_response);
 	return 0;
 }
 
 MODEM_CMD_DEFINE(on_cmd_error)
 {
 	modem_cmd_handler_set_error(data, -EIO);
-	k_sem_give(&sim800l_data_0.sem_response);
+	k_sem_give(&mdata.sem_response);
 	return 0;
 }
 
 MODEM_CMD_DEFINE(on_cmd_exterror)
 {
 	modem_cmd_handler_set_error(data, -EIO);
-	k_sem_give(&sim800l_data_0.sem_response);
+	k_sem_give(&mdata.sem_response);
 	return 0;
-}
-
-/*
- * Unlock the tx ready semaphore if '> ' is received.
- */
-MODEM_CMD_DIRECT_DEFINE(on_cmd_tx_ready)
-{
-	k_sem_give(&sim800l_data_0.sem_tx_ready);
-	return len;
 }
 
 /**
@@ -178,6 +79,7 @@ MODEM_CMD_DEFINE(on_urc_ftpget)
 MODEM_CMD_DIRECT_DEFINE(on_urc_rdy)
 {
 	LOG_DBG("RDY received");
+	k_sem_give(&mdata.boot_sem);
 	return 0;
 }
 
@@ -187,68 +89,228 @@ MODEM_CMD_DIRECT_DEFINE(on_urc_pwr_down)
 	return 0;
 }
 
-MODEM_CMD_DEFINE(on_urc_cpin)
+MODEM_CMD_DEFINE(on_psuttz)
 {
-	LOG_DBG("CPIN: %s", argv[0]);
+	int year, month, day, hour, minute, second;
+	char timezone[16];
+	int dst;
+
+	return 0;
+	/*
+	 * Parse PSUTTZ message format:
+	 * *PSUTTZ: <year>,<month>,<day>,<hour>,<minute>,<second>,"<timezone>",<dst>
+	 * Example: *PSUTTZ: 25,1,15,10,30,45,"+08",0
+	 *
+	 * Note: The timezone is quoted and needs to be parsed from argv[6]
+	 */
+	if (argc < 7) {
+		LOG_ERR("Invalid PSUTTZ message format, argc=%d (expected at least 7)", argc);
+		return -EINVAL;
+	}
+
+	year = atoi(argv[0]);   /* Year (2 digits, e.g., 25 for 2025) */
+	month = atoi(argv[1]);  /* Month (1-12) */
+	day = atoi(argv[2]);    /* Day (1-31) */
+	hour = atoi(argv[3]);   /* Hour (0-23) */
+	minute = atoi(argv[4]); /* Minute (0-59) */
+	second = atoi(argv[5]); /* Second (0-59) */
+
+	/* Parse timezone - remove quotes if present */
+	size_t tz_len = strlen(argv[6]);
+	if (tz_len > 0 && argv[6][0] == '"') {
+		/* Skip leading quote */
+		size_t copy_len = (tz_len > 2) ? (tz_len - 2) : 0;
+		if (copy_len >= sizeof(timezone)) {
+			copy_len = sizeof(timezone) - 1;
+		}
+		memcpy(timezone, argv[6] + 1, copy_len);
+		timezone[copy_len] = '\0';
+		/* Remove trailing quote if it exists */
+		if (copy_len > 0 && timezone[copy_len - 1] == '"') {
+			timezone[copy_len - 1] = '\0';
+		}
+	} else {
+		strncpy(timezone, argv[6], sizeof(timezone) - 1);
+		timezone[sizeof(timezone) - 1] = '\0';
+	}
+
+	/* DST might be in argv[7] if timezone parsing worked correctly */
+	dst = (argc >= 8) ? atoi(argv[7]) : 0;
+
+	LOG_INF("Network time: 20%02d-%02d-%02d %02d:%02d:%02d TZ=%s DST=%d", year, month, day,
+		hour, minute, second, timezone, dst);
+
+	/* TODO: Update system time if needed */
+	/* This could be used to synchronize the system clock with network time */
+
 	return 0;
 }
 
 /*
- * Parses the dns response from the modem.
- *
- * Response on success:
- * +CDNSGIP: 1,<domain name>,<IPv4>[,<IPv6>]
- *
- * Response on failure:
- * +CDNSGIP: 0,<err>
+ * Read manufacturer identification.
  */
-MODEM_CMD_DEFINE(on_cmd_cdnsgip)
+MODEM_CMD_DEFINE(on_cmd_cgmi)
 {
-	int state;
-	char ips[256];
-	size_t out_len;
-	int ret = -1;
-
-	state = atoi(argv[0]);
-	if (state == 0) {
-		LOG_ERR("DNS lookup failed with error %s", argv[1]);
-		goto exit;
-	}
-
-	/* Offset to skip the leading " */
-	out_len = net_buf_linearize(ips, sizeof(ips) - 1, data->rx_buf, 1, len);
-	ips[out_len] = '\0';
-
-	/* find trailing " */
-	char *ipv4 = strstr(ips, "\"");
-
-	if (!ipv4) {
-		LOG_ERR("Malformed DNS response!!");
-		goto exit;
-	}
-
-	*ipv4 = '\0';
-	net_addr_pton(dns_result.ai_family, ips,
-		      &((struct sockaddr_in *)&dns_result_addr)->sin_addr);
-	ret = 0;
-
-exit:
-	k_sem_give(&sim800l_data_0.sem_dns);
-	return ret;
+	size_t out_len = net_buf_linearize(mdata.manufacturer, sizeof(mdata.manufacturer) - 1,
+					   data->rx_buf, 0, len);
+	mdata.manufacturer[out_len] = '\0';
+	LOG_INF("Manufacturer: %s", mdata.manufacturer);
+	return 0;
 }
 
-// /*
-//  * Read manufacturer identification.
-//  */
-// MODEM_CMD_DEFINE(on_cmd_cgmi)
-// {
-// 	size_t out_len =
-// 		net_buf_linearize(sim800l_data_0.manufacturer,
-// 				  sizeof(sim800l_data_0.manufacturer) - 1, data->rx_buf, 0, len);
-// 	sim800l_data_0.manufacturer[out_len] = '\0';
-// 	LOG_INF("Manufacturer: %s", sim800l_data_0.manufacturer);
-// 	return 0;
-// }
+/*
+ * Read model identification.
+ */
+MODEM_CMD_DEFINE(on_cmd_cgmm)
+{
+	size_t out_len =
+		net_buf_linearize(mdata.model, sizeof(mdata.model) - 1, data->rx_buf, 0, len);
+
+	mdata.model[out_len] = '\0';
+	LOG_INF("Model: %s", mdata.model);
+	return 0;
+}
+
+/*
+ * Read software release.
+ *
+ * Response will be in format RESPONSE: <revision>.
+ */
+MODEM_CMD_DEFINE(on_cmd_cgmr)
+{
+	size_t out_len;
+	char *p;
+
+	out_len =
+		net_buf_linearize(mdata.revision, sizeof(mdata.revision) - 1, data->rx_buf, 0, len);
+	mdata.revision[out_len] = '\0';
+
+	/* The module prepends a Revision: */
+	p = strchr(mdata.revision, ':');
+	if (p) {
+		out_len = strlen(p + 1);
+		memmove(mdata.revision, p + 1, out_len + 1);
+	}
+
+	LOG_INF("Revision: %s", mdata.revision);
+	return 0;
+}
+
+/*
+ * Read serial number identification.
+ */
+MODEM_CMD_DEFINE(on_cmd_cgsn)
+{
+	size_t out_len =
+		net_buf_linearize(mdata.imei, sizeof(mdata.imei) - 1, data->rx_buf, 0, len);
+
+	mdata.imei[out_len] = '\0';
+	LOG_INF("IMEI: %s", mdata.imei);
+	return 0;
+}
+
+MODEM_CMD_DEFINE(on_urc_ciev)
+{
+	LOG_INF("+CIEV received");
+	return 0;
+}
+
+MODEM_CMD_DEFINE(on_urc_creg)
+{
+	int reg_state = atoi(argv[0]);
+
+	LOG_INF("+CREG: %d", reg_state);
+
+	if (reg_state == 1 || reg_state == 5) {
+		/* Registered on home network or roaming */
+		mdata.state = SIM800L_STATE_READY;
+		k_sem_give(&mdata.boot_sem);
+	} else {
+		/* Not registered */
+		mdata.state = SIM800L_STATE_INIT;
+	}
+
+	return 0;
+}
+
+MODEM_CMD_DEFINE(on_urc_cpin)
+{
+	if (strcmp(argv[0], "READY") == 0) {
+		mdata.status_flags |= SIM800L_STATUS_FLAG_CPIN_READY;
+	} else {
+		mdata.status_flags &= ~SIM800L_STATUS_FLAG_CPIN_READY;
+	}
+	k_sem_give(&mdata.boot_sem);
+
+	LOG_INF("CPIN: %s", argv[0]);
+	return 0;
+}
+
+MODEM_CMD_DEFINE(on_urc_pdp_deact)
+{
+	mdata.status_flags &= ~SIM800L_STATUS_FLAG_PDP_ACTIVE;
+	LOG_INF("PDP context deactivated by network");
+	return 0;
+}
+
+/* URC: +RECEIVE,<n>,<data length> */
+MODEM_CMD_DEFINE(on_urc_receive)
+{
+	struct modem_socket *sock;
+	int ret;
+	int sock_id;
+	int data_len;
+
+	sock_id = atoi(argv[0]);
+	data_len = atoi(argv[1]);
+
+	LOG_DBG("+RECEIVE: socket %d, length %d", sock_id, data_len);
+
+	/* Find the socket */
+	sock = modem_socket_from_id(&mdata.socket_config, sock_id);
+	if (!sock) {
+		return 0;
+	}
+
+	ret = modem_socket_packet_size_update(&mdata.socket_config, sock, data_len);
+	if (ret < 0) {
+		LOG_ERR("Failed to update packet size for socket %d: %d", sock_id, ret);
+		return 0;
+	}
+
+	if (data_len > 0) {
+		modem_socket_data_ready(&mdata.socket_config, sock);
+	}
+	return 0;
+}
+
+/*
+ * Handler for RSSI query.
+ *
+ * +CSQ: <rssi>,<ber>
+ *  rssi: 0,-115dBm; 1,-111dBm; 2...30,-110...-54dBm; 31,-52dBm or greater.
+ *        99, ukn
+ *  ber: Not used.
+ */
+MODEM_CMD_DEFINE(on_cmd_csq)
+{
+	int rssi = atoi(argv[0]);
+
+	if (rssi == 0) {
+		mdata.rssi = -115;
+	} else if (rssi == 1) {
+		mdata.rssi = -111;
+	} else if (rssi > 1 && rssi < 31) {
+		mdata.rssi = -114 + 2 * rssi;
+	} else if (rssi == 31) {
+		mdata.rssi = -52;
+	} else {
+		mdata.rssi = -1000;
+	}
+
+	LOG_INF("RSSI: %d", mdata.rssi);
+	return 0;
+}
 
 /*
  * Possible responses by the sim800l.
@@ -257,26 +319,31 @@ static const struct modem_cmd response_cmds[] = {
 	MODEM_CMD("OK", on_cmd_ok, 0U, ""),
 	MODEM_CMD("ERROR", on_cmd_error, 0U, ""),
 	MODEM_CMD("+CME ERROR: ", on_cmd_exterror, 1U, ""),
-	MODEM_CMD_DIRECT(">", on_cmd_tx_ready),
+
 };
 
 static const struct modem_cmd unsolicited_cmds[] = {
+	MODEM_CMD("+PDP: DEACT", on_urc_pdp_deact, 0U, ""),
 	MODEM_CMD("+FTPGET: 1,", on_urc_ftpget, 1U, ""),
 	MODEM_CMD("RDY", on_urc_rdy, 0U, ""),
 	MODEM_CMD("NORMAL POWER DOWN", on_urc_pwr_down, 0U, ""),
+	// MODEM_CMD("*PSUTTZ: ", on_psuttz, 7U, ","),
+	MODEM_CMD("+CIEV: ", on_urc_ciev, 0U, ","),
+	MODEM_CMD("+CREG: ", on_urc_creg, 1U, ","),
 	MODEM_CMD("+CPIN: ", on_urc_cpin, 1U, ","),
-
+	MODEM_CMD("+RECEIVE,", on_urc_receive, 2U, ","),
 };
 
-// /*
-//  * Commands to be sent at setup.
-//  */
-// static const struct setup_cmd setup_cmds[] = {
-// 	SETUP_CMD("AT+CGMI", "", on_cmd_cgmi, 0U, ""),
-// 	// SETUP_CMD("AT+CGMM", "", on_cmd_cgmm, 0U, ""),
-// 	// SETUP_CMD("AT+CGMR", "", on_cmd_cgmr, 0U, ""),
-// 	// SETUP_CMD("AT+CGSN", "", on_cmd_cgsn, 0U, ""),
-// };
+/*
+ * Commands to be sent at setup.
+ */
+static const struct setup_cmd setup_cmds[] = {
+	SETUP_CMD("AT+CGMI", "", on_cmd_cgmi, 0U, ""),
+	SETUP_CMD("AT+CGMM", "", on_cmd_cgmm, 0U, ""),
+	SETUP_CMD("AT+CGMR", "", on_cmd_cgmr, 0U, ""),
+	SETUP_CMD("AT+CGSN", "", on_cmd_cgsn, 0U, ""),
+
+};
 
 static int modem_reset(const struct device *dev)
 {
@@ -319,7 +386,7 @@ static int modem_power_on(const struct device *dev)
 		return 0;
 	}
 
-	LOG_DBG("Enabling modem");
+	LOG_DBG("Powering on modem");
 
 	/* SIM800L doesn't have a power pin - it's always powered when VCC is applied */
 	/* We can optionally perform a reset to ensure clean state */
@@ -331,7 +398,7 @@ static int modem_power_on(const struct device *dev)
 	}
 
 	data->powered = true;
-	LOG_DBG("Modem enabled");
+	LOG_DBG("Modem powered on");
 
 	return 0;
 }
@@ -358,6 +425,19 @@ static int modem_power_off(const struct device *dev)
 	LOG_DBG("Modem disabled");
 
 	return 0;
+}
+
+void modem_query_rssi(void)
+{
+	struct modem_cmd cmd[] = {MODEM_CMD("+CSQ: ", on_cmd_csq, 2U, ",")};
+	static char *send_cmd = "AT+CSQ";
+	int ret;
+
+	ret = modem_cmd_send(&mdata.ctx.iface, &mdata.ctx.cmd_handler, cmd, ARRAY_SIZE(cmd),
+			     send_cmd, &mdata.sem_response, MDM_CMD_TIMEOUT);
+	if (ret < 0) {
+		LOG_ERR("AT+CSQ ret:%d", ret);
+	}
 }
 
 #ifdef CONFIG_PM_DEVICE
@@ -392,218 +472,6 @@ static int modem_pm_action(const struct device *dev, enum pm_device_action actio
 #endif /* CONFIG_PM_DEVICE */
 
 /*
- * Perform a dns lookup.
- */
-static int offload_getaddrinfo(const char *node, const char *service,
-			       const struct zsock_addrinfo *hints, struct zsock_addrinfo **res)
-{
-	struct modem_cmd cmd[] = {MODEM_CMD("+CDNSGIP: ", on_cmd_cdnsgip, 2U, ",")};
-	char sendbuf[sizeof("AT+CDNSGIP=\"\",##,#####") + 128];
-	uint32_t port = 0;
-	int ret;
-
-	/* Modem is not attached to the network. */
-	if (sim800l_data_0.state != SIM800L_STATE_READY) {
-		LOG_ERR("Modem currently not attached to the network!");
-		return DNS_EAI_AGAIN;
-	}
-
-	/* init result */
-	(void)memset(&dns_result, 0, sizeof(dns_result));
-	(void)memset(&dns_result_addr, 0, sizeof(dns_result_addr));
-
-	/* Currently only support IPv4. */
-	dns_result.ai_family = AF_INET;
-	dns_result_addr.sa_family = AF_INET;
-	dns_result.ai_addr = &dns_result_addr;
-	dns_result.ai_addrlen = sizeof(dns_result_addr);
-	dns_result.ai_canonname = dns_result_canonname;
-	dns_result_canonname[0] = '\0';
-
-	if (service) {
-		port = atoi(service);
-		if (port < 1 || port > USHRT_MAX) {
-			return DNS_EAI_SERVICE;
-		}
-	}
-
-	if (port > 0U) {
-		if (dns_result.ai_family == AF_INET) {
-			net_sin(&dns_result_addr)->sin_port = htons(port);
-		}
-	}
-
-	/* Check if node is an IP address */
-	if (net_addr_pton(dns_result.ai_family, node,
-			  &((struct sockaddr_in *)&dns_result_addr)->sin_addr) == 0) {
-		*res = &dns_result;
-		return 0;
-	}
-
-	/* user flagged node as numeric host, but we failed net_addr_pton */
-	if (hints && hints->ai_flags & AI_NUMERICHOST) {
-		return DNS_EAI_NONAME;
-	}
-
-	ret = snprintk(sendbuf, sizeof(sendbuf), "AT+CDNSGIP=\"%s\",%u,%u", node,
-		       sim800l_data_0.dns.recount, sim800l_data_0.dns.timeout);
-	if (ret < 0) {
-		LOG_ERR("Formatting dns query failed");
-		return ret;
-	}
-
-	ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler, cmd, ARRAY_SIZE(cmd), sendbuf,
-			     &sim800l_data_0.sem_dns, MDM_DNS_TIMEOUT);
-	if (ret < 0) {
-		return ret;
-	}
-
-	*res = (struct zsock_addrinfo *)&dns_result;
-	return 0;
-}
-
-/*
- * Free addrinfo structure.
- */
-static void offload_freeaddrinfo(struct zsock_addrinfo *res)
-{
-	/* No need to free static memory. */
-	ARG_UNUSED(res);
-}
-
-/*
- * DNS vtable.
- */
-const struct socket_dns_offload offload_dns_ops = {
-	.getaddrinfo = offload_getaddrinfo,
-	.freeaddrinfo = offload_freeaddrinfo,
-};
-
-static inline uint8_t *modem_get_mac(const struct device *dev)
-{
-	struct sim800l_data *data = dev->data;
-	uint32_t hash_value;
-
-	data->mac_addr[0] = 0x00;
-	data->mac_addr[1] = 0x10;
-
-	/* use IMEI for mac_addr */
-	hash_value = hash32(sim800l_data_0.imei, strlen(sim800l_data_0.imei));
-
-	UNALIGNED_PUT(hash_value, (uint32_t *)(data->mac_addr + 2));
-
-	return data->mac_addr;
-}
-
-// static int modem_boot(bool allow_autobaud)
-// {
-// 	/* SIM800L does not support autobaud - assume fixed baudrate */
-// 	return 0;
-// }
-
-static int modem_setup(struct sim800l_data *data)
-{
-	uint8_t boot_tries = 0;
-	int ret = 0;
-
-	LOG_DBG("Setting up modem");
-
-	// /* Disable echo on successful boot */
-	// ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler, NULL, 0U, "ATE0",
-	// &data->sem_response, 		     K_MSEC(500)); if (ret != 0) {
-	// LOG_ERR("Disabling echo failed"); 	return ret;
-	// }
-
-	/* Try boot multiple times in case modem was already on */
-	while (boot_tries++ <= MDM_BOOT_TRIES) {
-		/* Reset modem and wait for ready indication */
-		ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler, NULL, 0U, "AT+CFUN=1,1",
-				     &data->sem_response, K_MSEC(500));
-		if (ret != 0) {
-			LOG_ERR("Reset failed");
-			return ret;
-		}
-		LOG_DBG("Modem booted successfully");
-		break;
-	}
-	// 	k_work_cancel_delayable(&mdata.rssi_query_work);
-
-	// 	ret = modem_boot(true);
-	// 	if (ret < 0) {
-	// 		LOG_ERR("Booting modem failed!!");
-	// 		return ret;
-	// 	}
-
-	// 	ret = modem_cmd_handler_setup_cmds(&mctx.iface, &mctx.cmd_handler, setup_cmds,
-	// 					   ARRAY_SIZE(setup_cmds), &mdata.sem_response,
-	// 					   MDM_REGISTRATION_TIMEOUT);
-	// 	if (ret < 0) {
-	// 		LOG_ERR("Modem setup commands failed!!");
-	// 		return ret;
-	// 	}
-	// 	return ret;
-
-	return ret;
-}
-
-static ssize_t offload_read(void *obj, void *buffer, size_t count)
-{
-	errno = ENOTSUP;
-	return -1;
-}
-
-static ssize_t offload_write(void *obj, const void *buffer, size_t count)
-{
-	errno = ENOTSUP;
-	return -1;
-}
-
-static int offload_close(void *obj)
-{
-	errno = ENOTSUP;
-	return -1;
-}
-
-static int offload_ioctl(void *obj, unsigned int request, va_list args)
-{
-	errno = ENOTSUP;
-	return -1;
-}
-
-static int offload_connect(void *obj, const struct sockaddr *addr, socklen_t addrlen)
-{
-	errno = ENOTSUP;
-	return -1;
-}
-
-static ssize_t offload_sendto(void *obj, const void *buf, size_t len, int flags,
-			      const struct sockaddr *dest_addr, socklen_t addrlen)
-{
-	errno = ENOTSUP;
-	return -1;
-}
-
-static ssize_t offload_recvfrom(void *obj, void *buf, size_t max_len, int flags,
-				struct sockaddr *src_addr, socklen_t *addrlen)
-{
-	errno = ENOTSUP;
-	return -1;
-}
-
-const struct socket_op_vtable offload_socket_fd_op_vtable = {
-	.fd_vtable =
-		{
-			.read = offload_read,
-			.write = offload_write,
-			.close = offload_close,
-			.ioctl = offload_ioctl,
-		},
-	.connect = offload_connect,
-	.sendto = offload_sendto,
-	.recvfrom = offload_recvfrom,
-};
-
-/*
  * Process all messages received from the modem.
  */
 static void modem_rx(void *p1, void *p2, void *p3)
@@ -614,33 +482,131 @@ static void modem_rx(void *p1, void *p2, void *p3)
 
 	while (true) {
 		/* Wait for incoming UART data */
-		modem_iface_uart_rx_wait(&mctx.iface, K_FOREVER);
+		modem_iface_uart_rx_wait(&mdata.ctx.iface, K_FOREVER);
 
 		/* Process AT command responses and unsolicited messages */
-		modem_cmd_handler_process(&mctx.cmd_handler, &mctx.iface);
+		modem_cmd_handler_process(&mdata.ctx.cmd_handler, &mdata.ctx.iface);
+
+		/* give up time if we have a solid stream of data */
+		k_yield();
 	}
+}
+
+/**
+ * Performs the autobaud sequence until modem answers or limit is reached.
+ *
+ * @return On successful boot 0 is returned. Otherwise <0 is returned.
+ */
+static int modem_autobaud(void)
+{
+	int boot_tries = 0;
+	int counter = 0;
+	int ret = 0;
+
+	while (boot_tries++ <= MDM_BOOT_TRIES) {
+		modem_reset(mdata.ctx.iface.dev);
+
+		/*
+		 * The sim7080 has a autobaud function.
+		 * On startup multiple AT's are sent until
+		 * a OK is received.
+		 */
+		counter = 0;
+		while (counter < MDM_MAX_AUTOBAUD) {
+			ret = modem_cmd_send(&mdata.ctx.iface, &mdata.ctx.cmd_handler, NULL, 0U,
+					     "AT", &mdata.sem_response, MDM_CMD_TIMEOUT);
+
+			/* OK was received. */
+			if (ret == 0) {
+				/* Disable echo */
+				return modem_cmd_send(&mdata.ctx.iface, &mdata.ctx.cmd_handler,
+						      NULL, 0U, "ATE0", &mdata.sem_response,
+						      MDM_CMD_TIMEOUT);
+			}
+			counter++;
+		}
+	}
+	return ret;
+}
+
+static int modem_boot(void)
+{
+	int ret = 0;
+
+	LOG_DBG("Booting modem");
+
+	k_work_cancel_delayable(&mdata.rssi_query_work);
+
+	ret = modem_autobaud();
+	if (ret != 0) {
+		LOG_ERR("Modem autobaud failed");
+		return ret;
+	}
+
+	k_sem_reset(&mdata.boot_sem);
+	ret = k_sem_take(&mdata.boot_sem, K_SECONDS(5));
+	if (ret != 0) {
+		LOG_ERR("Timeout while waiting for RDY");
+		return ret;
+	}
+
+	/* Wait for sim card status */
+	ret = k_sem_take(&mdata.boot_sem, K_SECONDS(10));
+	if (ret != 0) {
+		LOG_ERR("Timeout while waiting for sim status");
+		return ret;
+	}
+
+	if ((mdata.status_flags & SIM800L_STATUS_FLAG_CPIN_READY) == 0) {
+		LOG_ERR("Sim card not ready!");
+		return -EIO;
+	}
+
+	mdata.state = SIM800L_STATE_READY;
+
+	/* Send setup commands */
+	ret = modem_cmd_handler_setup_cmds(&mdata.ctx.iface, &mdata.ctx.cmd_handler, setup_cmds,
+					   ARRAY_SIZE(setup_cmds), &mdata.sem_response,
+					   MDM_REGISTRATION_TIMEOUT);
+	if (ret < 0) {
+		LOG_ERR("Failed to send init commands!");
+		return ret;
+	}
+
+	k_sleep(K_SECONDS(3));
+
+	ret = modem_pdp_activate();
+	if (ret < 0) {
+		LOG_ERR("Failed to activate PDP context: %d", ret);
+		return ret;
+	}
+
+	LOG_INF("Modem boot complete");
+	return ret;
 }
 
 static int modem_init(const struct device *dev)
 {
-	struct sim800l_data *data = dev->data;
-	const struct sim800l_config *config = dev->config;
+
 	int ret;
 
 	LOG_DBG("Initializing modem");
 
-	k_sem_init(&data->sem_tx_ready, 0, 1);
-	k_sem_init(&data->sem_response, 0, 1);
-	k_sem_init(&data->sem_dns, 0, 1);
+	mdata.status_flags = 0;
+
+	k_sem_init(&mdata.sem_tx_ready, 0, 1);
+	k_sem_init(&mdata.sem_response, 0, 1);
+	k_sem_init(&mdata.sem_dns, 0, 1);
+	k_sem_init(&mdata.boot_sem, 0, 1);
 
 	/* Initialize reset GPIO */
-	if (data->reset_gpio.port) {
-		if (!gpio_is_ready_dt(&data->reset_gpio)) {
+	if (mdata.reset_gpio.port) {
+		if (!gpio_is_ready_dt(&mdata.reset_gpio)) {
 			LOG_ERR("Reset GPIO device not ready");
 			return -ENODEV;
 		}
 
-		ret = gpio_pin_configure_dt(&data->reset_gpio, GPIO_OUTPUT_ACTIVE);
+		ret = gpio_pin_configure_dt(&mdata.reset_gpio, GPIO_OUTPUT_ACTIVE);
 		if (ret < 0) {
 			LOG_ERR("Failed to configure reset GPIO: %d", ret);
 			return ret;
@@ -648,7 +614,7 @@ static int modem_init(const struct device *dev)
 	}
 
 	/* Socket config. */
-	ret = modem_socket_init(&data->socket_config, &data->sockets[0], ARRAY_SIZE(data->sockets),
+	ret = modem_socket_init(&mdata.socket_config, &mdata.sockets[0], ARRAY_SIZE(mdata.sockets),
 				MDM_BASE_SOCKET_NUM, true, &offload_socket_fd_op_vtable);
 	if (ret < 0) {
 		return ret;
@@ -656,19 +622,19 @@ static int modem_init(const struct device *dev)
 
 	/* Command handler. */
 	const struct modem_cmd_handler_config cmd_handler_config = {
-		.match_buf = &data->cmd_match_buf[0],
-		.match_buf_len = sizeof(data->cmd_match_buf),
+		.match_buf = &mdata.cmd_match_buf[0],
+		.match_buf_len = sizeof(mdata.cmd_match_buf),
 		.buf_pool = &mdm_recv_pool,
 		.alloc_timeout = BUF_ALLOC_TIMEOUT,
 		.eol = "\r\n",
-		.user_data = data,
+		.user_data = NULL,
 		.response_cmds = response_cmds,
 		.response_cmds_len = ARRAY_SIZE(response_cmds),
 		.unsol_cmds = unsolicited_cmds,
 		.unsol_cmds_len = ARRAY_SIZE(unsolicited_cmds),
 	};
 
-	ret = modem_cmd_handler_init(&mctx.cmd_handler, &data->cmd_handler_data,
+	ret = modem_cmd_handler_init(&mdata.ctx.cmd_handler, &mdata.cmd_handler_data,
 				     &cmd_handler_config);
 	if (ret < 0) {
 		return ret;
@@ -676,18 +642,17 @@ static int modem_init(const struct device *dev)
 
 	/* Uart handler. */
 	const struct modem_iface_uart_config uart_config = {
-		.rx_rb_buf = &data->iface_rb_buf[0],
-		.rx_rb_buf_len = sizeof(data->iface_rb_buf),
-		.dev = config->uart,
+		.rx_rb_buf = &mdata.iface_rb_buf[0],
+		.rx_rb_buf_len = sizeof(mdata.iface_rb_buf),
+		.dev = mconfig.uart,
 		.hw_flow_control = false,
 	};
 
-	ret = modem_iface_uart_init(&mctx.iface, &data->iface_data, &uart_config);
+	ret = modem_iface_uart_init(&mdata.ctx.iface, &mdata.iface_data, &uart_config);
 	if (ret < 0) {
 		return ret;
 	}
 
-	LOG_DBG("Powering on modem");
 	ret = modem_power_on(dev);
 	if (ret < 0) {
 		LOG_ERR("Failed to power on modem: %d", ret);
@@ -698,12 +663,12 @@ static int modem_init(const struct device *dev)
 #endif /* CONFIG_PM_DEVICE */
 
 	/* Modem data storage. */
-	mctx.data_manufacturer = data->manufacturer;
-	mctx.data_model = data->model;
-	mctx.data_revision = data->revision;
-	mctx.data_imei = data->imei;
-	mctx.driver_data = data;
-	ret = modem_context_register(&mctx);
+	mdata.ctx.data_manufacturer = mdata.manufacturer;
+	mdata.ctx.data_model = mdata.model;
+	mdata.ctx.data_revision = mdata.revision;
+	mdata.ctx.data_imei = mdata.imei;
+	mdata.ctx.driver_data = &mdata;
+	ret = modem_context_register(&mdata.ctx);
 	if (ret < 0) {
 		LOG_ERR("Error registering modem context: %d", ret);
 		return ret;
@@ -715,7 +680,8 @@ static int modem_init(const struct device *dev)
 
 	k_thread_name_set(tid, "modem_rx");
 	k_sleep(K_MSEC(100));
-	return modem_setup(data);
+
+	return modem_boot();
 }
 
 #ifdef CONFIG_PM_DEVICE
@@ -724,58 +690,14 @@ PM_DEVICE_DT_INST_DEFINE(0, modem_pm_action);
 
 #define MODEM_SIMCOM_SIM800L_INIT_PRIORITY 90
 
-static bool offload_is_supported(int family, int type, int proto)
-{
-	if (family != AF_INET && family != AF_INET6) {
-		return false;
-	}
-
-	if (type != SOCK_DGRAM && type != SOCK_STREAM) {
-		return false;
-	}
-
-	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP) {
-		return false;
-	}
-
-	return true;
-}
-
-static int offload_socket(int family, int type, int proto)
-{
-	int ret;
-
-	ret = modem_socket_get(&sim800l_data_0.socket_config, family, type, proto);
-	if (ret < 0) {
-		errno = -ret;
-		return -1;
-	}
-
-	errno = 0;
-	return ret;
-}
-
-/* Setup the Modem NET Interface. */
-static void modem_net_iface_init(struct net_if *iface)
-{
-	const struct device *dev = net_if_get_device(iface);
-	struct sim800l_data *data = dev->data;
-
-	net_if_set_link_addr(iface, modem_get_mac(dev), sizeof(data->mac_addr), NET_LINK_ETHERNET);
-
-	data->netif = iface;
-
-	socket_offload_dns_register(&offload_dns_ops);
-
-	net_if_socket_offload_set(iface, offload_socket);
-}
-
 static struct offloaded_if_api api_funcs = {
 	.iface_api.init = modem_net_iface_init,
 };
 
 // /* Register device with the networking stack. */
-NET_DEVICE_DT_INST_OFFLOAD_DEFINE(0, modem_init, NULL, &sim800l_data_0, &sim800l_config_0,
+NET_DEVICE_DT_INST_OFFLOAD_DEFINE(0, modem_init, PM_DEVICE_DT_INST_GET(0), &mdata, &mconfig,
 				  CONFIG_GPIO_INIT_PRIORITY, &api_funcs, MDM_MAX_DATA_LENGTH);
-NET_SOCKET_OFFLOAD_REGISTER(simcom_sim800l, CONFIG_GPIO_INIT_PRIORITY, AF_UNSPEC,
-			    offload_is_supported, offload_socket);
+
+/* Register NET sockets. */
+NET_SOCKET_OFFLOAD_REGISTER(simcom_sim800l, CONFIG_NET_SOCKETS_OFFLOAD_PRIORITY, AF_UNSPEC,
+			    modem_offload_is_supported, modem_offload_socket);

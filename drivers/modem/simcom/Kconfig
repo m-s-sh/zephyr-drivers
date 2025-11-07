@@ -23,10 +23,22 @@ config MODEM_SIM800L
 
 if MODEM_SIM800L
 
-config MODEM_SIM800L_INIT_PRIORITY
-	int "SIM800L initialization priority"
-	default 80
+config MODEM_SIM800L_LOG_LEVEL
+	int "SIM800L modem log level"
+	default 1
 	help
-	  SIM800L driver initialization priority.
+	  Set the log level for SIM800L modem driver.
+	  0 - None
+	  1 - Error messages
+	  2 - Warning messages
+	  3 - Informational messages
+	  4 - Debug messages
+
+config MODEM_SIM800L_APN
+	string "SIM800L APN"
+	default "internet"
+	help
+	  Access Point Name (APN) for SIM800L modem data connection.
+	  Leave empty if not required by your network provider.
 
 endif # MODEM_SIM800L

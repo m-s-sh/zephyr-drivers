@@ -8,20 +8,144 @@
 #include <zephyr/kernel.h>
 #include <zephyr/pm/device.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/net/socket.h>
+
+LOG_MODULE_REGISTER(sim800l_test, LOG_LEVEL_DBG);
 
 const struct device *modem = DEVICE_DT_GET(DT_ALIAS(modem));
 
+/* Simple HTTP GET request test */
+static int test_http_get(void)
+{
+	int sock;
+	int ret;
+	struct sockaddr_in addr;
+	char request[] = "GET / HTTP/1.0\r\nHost: httpbin.org\r\n\r\n";
+	char response[512];
+
+	LOG_INF("Testing HTTP GET...");
+
+	/* Create TCP socket */
+	sock = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (sock < 0) {
+		LOG_ERR("Failed to create socket: %d", errno);
+		return -1;
+	}
+	LOG_INF("Socket created: %d", sock);
+
+	/* Connect to google.com:80 (142.250.189.174) */
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(80);
+	/* google.com IP - you may need to update this */
+	zsock_inet_pton(AF_INET, "142.250.189.174", &addr.sin_addr);
+
+	LOG_INF("Connecting to google.com:80...");
+	ret = zsock_connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+	if (ret < 0) {
+		LOG_ERR("Failed to connect: %d", errno);
+		zsock_close(sock);
+		return -1;
+	}
+	LOG_INF("Connected successfully!");
+
+	/* Send HTTP request */
+	LOG_INF("Sending HTTP request...");
+	ret = zsock_send(sock, request, strlen(request), 0);
+	if (ret < 0) {
+		LOG_ERR("Failed to send: %d", errno);
+		zsock_close(sock);
+		return -1;
+	}
+	LOG_INF("Sent %d bytes", ret);
+
+	/* Receive response */
+	LOG_INF("Waiting for response...");
+	ret = zsock_recv(sock, response, sizeof(response) - 1, 0);
+	if (ret < 0) {
+		LOG_ERR("Failed to receive: %d", errno);
+		zsock_close(sock);
+		return -1;
+	}
+
+	response[ret] = '\0';
+	LOG_INF("Received %d bytes:", ret);
+	LOG_INF("%s", response);
+
+	/* Close socket */
+	zsock_close(sock);
+	LOG_INF("Socket closed");
+
+	return 0;
+}
+
+/* Simple socket creation test */
+static int test_socket_create(void)
+{
+	int sock;
+
+	LOG_INF("Testing socket creation...");
+
+	/* Create TCP socket */
+	sock = zsock_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (sock < 0) {
+		LOG_ERR("Failed to create TCP socket: %d", errno);
+		return -1;
+	}
+	LOG_INF("TCP socket created: %d", sock);
+	zsock_close(sock);
+
+	/* Create UDP socket */
+	sock = zsock_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (sock < 0) {
+		LOG_ERR("Failed to create UDP socket: %d", errno);
+		return -1;
+	}
+	LOG_INF("UDP socket created: %d", sock);
+	zsock_close(sock);
+
+	LOG_INF("Socket creation test PASSED");
+	return 0;
+}
+
 int main(void)
 {
-	printk("Starting SIM800L modem sample application\n");
 
-	/* Application code to initialize and use the SIM800L modem goes here */
-	printk("Powering on\n");
-	//pm_device_action_run(modem, PM_DEVICE_ACTION_RESUME);
+	int ret;
 
-	while(1) {
-		k_sleep(K_SECONDS(10));
-		printk("Modem running...\n");
+	LOG_INF("SIM800L Modem Driver Test");
+
+	/* Resume modem device (power on) */
+	pm_device_action_run(modem, PM_DEVICE_ACTION_RESUME);
+	/* Check if modem device is ready */
+	if (!device_is_ready(modem)) {
+		LOG_ERR("Modem device not ready!");
+		return -1;
 	}
+	LOG_INF("Modem device is ready");
+
+	// /* Test 1: Socket creation */
+	// ret = test_socket_create();
+	// if (ret < 0) {
+	// 	LOG_ERR("Socket creation test FAILED");
+	// }
+
+	k_sleep(K_SECONDS(2));
+
+	/* Test 2: HTTP GET (comment out if no internet connection) */
+	ret = test_http_get();
+	if (ret < 0) {
+		LOG_ERR("HTTP GET test FAILED");
+	} else {
+		LOG_INF("HTTP GET test PASSED");
+	}
+
+	LOG_INF("\n=== Test completed ===\n");
+
+	/* Keep running */
+	while (1) {
+		k_sleep(K_SECONDS(30));
+	}
+
 	return 0;
 }
