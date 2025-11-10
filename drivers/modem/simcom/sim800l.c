@@ -19,7 +19,7 @@ LOG_MODULE_REGISTER(modem_simcom_sim800l, CONFIG_MODEM_SIM800L_LOG_LEVEL);
 #include "sim800l.h"
 
 static struct k_thread modem_rx_thread;
-static K_KERNEL_STACK_DEFINE(modem_rx_stack, 1028); /* 1024 + 4 sentinel */
+static K_KERNEL_STACK_DEFINE(modem_rx_stack, 2048);
 NET_BUF_POOL_DEFINE(mdm_recv_pool, MDM_RECV_MAX_BUF, MDM_RECV_BUF_SIZE, 0, NULL);
 
 /* Device instance definition */
@@ -137,7 +137,7 @@ MODEM_CMD_DEFINE(on_psuttz)
 	/* DST might be in argv[7] if timezone parsing worked correctly */
 	dst = (argc >= 8) ? atoi(argv[7]) : 0;
 
-	LOG_INF("Network time: 20%02d-%02d-%02d %02d:%02d:%02d TZ=%s DST=%d", year, month, day,
+	LOG_DBG("Network time: 20%02d-%02d-%02d %02d:%02d:%02d TZ=%s DST=%d", year, month, day,
 		hour, minute, second, timezone, dst);
 
 	/* TODO: Update system time if needed */
@@ -154,7 +154,7 @@ MODEM_CMD_DEFINE(on_cmd_cgmi)
 	size_t out_len = net_buf_linearize(mdata.manufacturer, sizeof(mdata.manufacturer) - 1,
 					   data->rx_buf, 0, len);
 	mdata.manufacturer[out_len] = '\0';
-	LOG_INF("Manufacturer: %s", mdata.manufacturer);
+	LOG_DBG("Manufacturer: %s", mdata.manufacturer);
 	return 0;
 }
 
@@ -167,7 +167,7 @@ MODEM_CMD_DEFINE(on_cmd_cgmm)
 		net_buf_linearize(mdata.model, sizeof(mdata.model) - 1, data->rx_buf, 0, len);
 
 	mdata.model[out_len] = '\0';
-	LOG_INF("Model: %s", mdata.model);
+	LOG_DBG("Model: %s", mdata.model);
 	return 0;
 }
 
@@ -192,7 +192,7 @@ MODEM_CMD_DEFINE(on_cmd_cgmr)
 		memmove(mdata.revision, p + 1, out_len + 1);
 	}
 
-	LOG_INF("Revision: %s", mdata.revision);
+	LOG_DBG("Revision: %s", mdata.revision);
 	return 0;
 }
 
@@ -205,13 +205,13 @@ MODEM_CMD_DEFINE(on_cmd_cgsn)
 		net_buf_linearize(mdata.imei, sizeof(mdata.imei) - 1, data->rx_buf, 0, len);
 
 	mdata.imei[out_len] = '\0';
-	LOG_INF("IMEI: %s", mdata.imei);
+	LOG_DBG("IMEI: %s", mdata.imei);
 	return 0;
 }
 
 MODEM_CMD_DEFINE(on_urc_ciev)
 {
-	LOG_INF("+CIEV received");
+	LOG_DBG("+CIEV received");
 	return 0;
 }
 
@@ -219,7 +219,7 @@ MODEM_CMD_DEFINE(on_urc_creg)
 {
 	int reg_state = atoi(argv[0]);
 
-	LOG_INF("+CREG: %d", reg_state);
+	LOG_DBG("+CREG: %d", reg_state);
 
 	if (reg_state == 1 || reg_state == 5) {
 		/* Registered on home network or roaming */
@@ -242,24 +242,25 @@ MODEM_CMD_DEFINE(on_urc_cpin)
 	}
 	k_sem_give(&mdata.boot_sem);
 
-	LOG_INF("CPIN: %s", argv[0]);
+	LOG_DBG("CPIN: %s", argv[0]);
 	return 0;
 }
 
 MODEM_CMD_DEFINE(on_urc_pdp_deact)
 {
 	mdata.status_flags &= ~SIM800L_STATUS_FLAG_PDP_ACTIVE;
-	LOG_INF("PDP context deactivated by network");
+	LOG_DBG("PDP context deactivated by network");
 	return 0;
 }
 
-/* URC: +RECEIVE,<n>,<data length> */
+/* URC: +RECEIVE,<n>,<data length>:\r\n<data> */
 MODEM_CMD_DEFINE(on_urc_receive)
 {
 	struct modem_socket *sock;
 	int ret;
 	int sock_id;
 	int data_len;
+	uint8_t chunk[128];
 
 	sock_id = atoi(argv[0]);
 	data_len = atoi(argv[1]);
@@ -269,18 +270,98 @@ MODEM_CMD_DEFINE(on_urc_receive)
 	/* Find the socket */
 	sock = modem_socket_from_id(&mdata.socket_config, sock_id);
 	if (!sock) {
+		LOG_WRN("Received data for unknown socket %d", sock_id);
 		return 0;
 	}
+	// 1. read any data after +RECEIVE,<n>,<data length> from rx_buf skip :\r\n
+	// 2. read additional data from uart till the data_len is reached
+	// 3. append all read data to
+	struct sim800l_socket_data *sock_data = (struct sim800l_socket_data *)sock->data;
 
-	ret = modem_socket_packet_size_update(&mdata.socket_config, sock, data_len);
-	if (ret < 0) {
-		LOG_ERR("Failed to update packet size for socket %d: %d", sock_id, ret);
-		return 0;
+	k_mutex_lock(&sock_data->lock, K_FOREVER);
+
+	if (!sock_data->rx_buf) {
+		sock_data->rx_buf = net_buf_alloc(&mdm_recv_pool, K_NO_WAIT);
+		if (!sock_data->rx_buf) {
+			LOG_ERR("Socket %d RX buffer alloc failed", sock_id);
+			k_mutex_unlock(&sock_data->lock);
+			return 0;
+		}
+	}
+	/* Read remaining data from data->rx_buf buffer.
+	 * The buffer contains: <data_length>:\r\n<partial_payload>
+	 * We need to find ':', skip ':\r\n', then copy the payload.
+	 */
+
+	/* Search for ':' marker in the buffer and skip everything up to and including :\r\n */
+	bool found_colon = false;
+
+	while (data->rx_buf->len > 0 && !found_colon) {
+		/* Check if current byte is ':' */
+		uint8_t byte = net_buf_pull_u8(data->rx_buf);
+
+		if (byte == ':') {
+			found_colon = true;
+			/* Now skip \r\n (2 more bytes) */
+			size_t crlf_to_skip = MIN((size_t)2, data->rx_buf->len);
+			net_buf_pull(data->rx_buf, crlf_to_skip);
+			break;
+		}
+
+		/* Not the colon yet, skip this byte */
+		net_buf_pull_u8(data->rx_buf);
 	}
 
-	if (data_len > 0) {
+	/* Now copy payload data from rx_buf to socket buffer */
+	while (data_len > 0 && data->rx_buf->len > 0) {
+		size_t to_copy = MIN((size_t)data_len, data->rx_buf->len);
+
+		if (net_buf_tailroom(sock_data->rx_buf) < to_copy) {
+			LOG_ERR("Socket %d RX buffer overflow", sock_id);
+			break;
+		}
+
+		net_buf_add_mem(sock_data->rx_buf, data->rx_buf->data, to_copy);
+		net_buf_pull(data->rx_buf, to_copy);
+		sock_data->buffered += to_copy;
+		data_len -= to_copy;
+	}
+
+	/* Read available data from UART to the socket RX buffer */
+	while (data_len > 0) {
+		size_t to_read = MIN(data_len, sizeof(chunk));
+		size_t bytes_read;
+
+		ret = mdata.ctx.iface.read(&mdata.ctx.iface, chunk, to_read, &bytes_read);
+		LOG_DBG("Socket %d read %d bytes", sock_id, bytes_read);
+		if (ret < 0) {
+			LOG_ERR("Socket %d read error: %d", sock_id, ret);
+			break;
+		}
+		if (bytes_read == 0) {
+			/* No more data available */
+			break;
+		}
+
+		/* Append to socket RX buffer */
+		if (net_buf_tailroom(sock_data->rx_buf) < bytes_read) {
+			LOG_ERR("Socket %d RX buffer overflow", sock_id);
+			break;
+		}
+		net_buf_add_mem(sock_data->rx_buf, chunk, bytes_read);
+		sock_data->buffered += bytes_read;
+		data_len -= bytes_read;
+	}
+
+	k_mutex_unlock(&sock_data->lock);
+
+	LOG_DBG("Socket %d total buffered data: %d bytes", sock_id, sock_data->buffered);
+	if (sock_data->buffered > 0) {
+		/* Update socket packet size to reflect available data */
+		modem_socket_packet_size_update(&mdata.socket_config, sock, sock_data->buffered);
 		modem_socket_data_ready(&mdata.socket_config, sock);
 	}
+
 	return 0;
 }
 
@@ -308,7 +389,7 @@ MODEM_CMD_DEFINE(on_cmd_csq)
 		mdata.rssi = -1000;
 	}
 
-	LOG_INF("RSSI: %d", mdata.rssi);
+	LOG_DBG("RSSI: %d", mdata.rssi);
 	return 0;
 }
 
@@ -350,8 +431,6 @@ static int modem_reset(const struct device *dev)
 	struct sim800l_data *data = dev->data;
 	int ret;
 
-	LOG_DBG("Resetting modem");
-
 	if (data->reset_gpio.port) {
 		/* Assert reset */
 		ret = gpio_pin_set_dt(&data->reset_gpio, 0);
@@ -386,8 +465,6 @@ static int modem_power_on(const struct device *dev)
 		return 0;
 	}
 
-	LOG_DBG("Powering on modem");
-
 	/* SIM800L doesn't have a power pin - it's always powered when VCC is applied */
 	/* We can optionally perform a reset to ensure clean state */
 	if (data->reset_gpio.port) {
@@ -410,8 +487,6 @@ static int modem_power_off(const struct device *dev)
 	if (!data->powered) {
 		return 0;
 	}
-
-	LOG_DBG("Disabling modem");
 
 	/* SIM800L doesn't have a power pin - we can only put it in reset state */
 	/* or send AT+CPOWD=1 command to software power down */
@@ -597,6 +672,7 @@ static int modem_init(const struct device *dev)
 	k_sem_init(&mdata.sem_tx_ready, 0, 1);
 	k_sem_init(&mdata.sem_response, 0, 1);
 	k_sem_init(&mdata.sem_dns, 0, 1);
+	k_sem_init(&mdata.sem_sock_conn, 0, 1);
 	k_sem_init(&mdata.boot_sem, 0, 1);
 
 	/* Initialize reset GPIO */
@@ -618,6 +694,15 @@ static int modem_init(const struct device *dev)
 				MDM_BASE_SOCKET_NUM, true, &offload_socket_fd_op_vtable);
 	if (ret < 0) {
 		return ret;
+	}
+
+	for (int i = 0; i < MDM_MAX_SOCKETS; i++) {
+		struct sim800l_socket_data *sock_data = &mdata.socket_data[i];
+
+		sock_data->rx_buf = NULL;
+		sock_data->buffered = 0;
+		k_mutex_init(&sock_data->lock);
+		mdata.sockets[i].data = sock_data;
 	}
 
 	/* Command handler. */

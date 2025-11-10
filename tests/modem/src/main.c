@@ -20,7 +20,7 @@ static int test_http_get(void)
 	int sock;
 	int ret;
 	struct sockaddr_in addr;
-	char request[] = "GET / HTTP/1.0\r\nHost: httpbin.org\r\n\r\n";
+	char request[] = "12345678910\n";
 	char response[512];
 
 	LOG_INF("Testing HTTP GET...");
@@ -33,14 +33,15 @@ static int test_http_get(void)
 	}
 	LOG_INF("Socket created: %d", sock);
 
-	/* Connect to google.com:80 (142.250.189.174) */
+	/* Connect to tcpbin.com:4242 */
+
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
-	addr.sin_port = htons(80);
-	/* google.com IP - you may need to update this */
-	zsock_inet_pton(AF_INET, "142.250.189.174", &addr.sin_addr);
+	addr.sin_port = htons(4242);
+	/* tcpbin.com IP - you may need to update this */
+	zsock_inet_pton(AF_INET, "45.79.112.203", &addr.sin_addr);
 
-	LOG_INF("Connecting to google.com:80...");
+	LOG_INF("Connecting to tcpbin.com:4242...");
 	ret = zsock_connect(sock, (struct sockaddr *)&addr, sizeof(addr));
 	if (ret < 0) {
 		LOG_ERR("Failed to connect: %d", errno);
@@ -75,7 +76,11 @@ static int test_http_get(void)
 	/* Close socket */
 	zsock_close(sock);
 	LOG_INF("Socket closed");
-
+	/* Compare sent and received data */
+	if (ret != strlen(request) || memcmp(request, response, ret) != 0) {
+		LOG_ERR("Data mismatch!");
+		return -1;
+	}
 	return 0;
 }
 

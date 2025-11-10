@@ -17,10 +17,12 @@
 #include <modem_iface_uart.h>
 #include <modem_cmd_handler.h>
 #include <modem_socket.h>
+#include <zephyr/net_buf.h>
 
 #define BUF_ALLOC_TIMEOUT        K_SECONDS(1)
 #define MDM_DNS_TIMEOUT          K_SECONDS(210)
 #define MDM_REGISTRATION_TIMEOUT K_SECONDS(180)
+#define MDM_CONN_TIMEOUT         K_SECONDS(120)
 #define MDM_CMD_TIMEOUT          K_SECONDS(10)
 #define MDM_WAIT_FOR_RSSI_DELAY  K_SECONDS(2)
 #define MDM_RSSI_TIMEOUT_SECS    30
@@ -63,6 +65,12 @@ enum sim800l_status_flags {
 	SIM800L_STATUS_FLAG_PDP_ACTIVE = 0x08,
 };
 
+struct sim800l_socket_data {
+	struct net_buf *rx_buf;
+	size_t buffered;
+	struct k_mutex lock;
+};
+
 struct sim800l_data {
 	struct modem_context ctx;
 	/* Modem status flags */
@@ -84,6 +92,7 @@ struct sim800l_data {
 	 */
 	struct modem_socket_config socket_config;
 	struct modem_socket sockets[MDM_MAX_SOCKETS];
+	struct sim800l_socket_data socket_data[MDM_MAX_SOCKETS];
 
 	/* modem cmds */
 	struct modem_cmd_handler_data cmd_handler_data;
@@ -128,6 +137,7 @@ struct sim800l_data {
 	struct k_sem sem_tx_ready;
 	struct k_sem sem_rx_data;
 	struct k_sem sem_response;
+	struct k_sem sem_sock_conn;
 	struct k_sem sem_dns;
 	struct k_sem boot_sem;
 };

@@ -9,6 +9,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/net/offloaded_netdev.h>
 #include <zephyr/net/socket_offload.h>
+#include <zephyr/net_buf.h>
 
 #include "sim800l.h"
 
@@ -62,35 +63,57 @@ exit:
 	return ret;
 }
 
-/* Socket response handlers */
+/* Response format: <socket_id>, "CONNECT OK" or "CONNECT FAIL" */
 MODEM_CMD_DEFINE(on_cmd_cipstart)
 {
-	int socket_id, state;
-
-	LOG_DBG("data len: %d, argc: %d", len, argc);
-	k_sem_give(&mdata.sem_dns);
-	socket_id = atoi(argv[0]);
-	mdata.sockets[socket_id].is_connected = true;
-	LOG_DBG("on_cmd_cipstart called");
-	return 0;
-	/* Response format: <socket_id>, "CONNECT OK" or "CONNECT FAIL" */
-
-	if (socket_id < 0 || socket_id >= MDM_MAX_SOCKETS) {
-		LOG_ERR("Invalid socket_id: %d", socket_id);
+	if (argc < 2) {
 		return -EINVAL;
 	}
 
-	if (argc > 1 && strcmp(argv[1], "CONNECT OK") == 0) {
-		mdata.sockets[socket_id].is_connected = true;
-		LOG_DBG("Socket %d connected", socket_id);
-	} else {
-		mdata.sockets[socket_id].is_connected = false;
-		LOG_ERR("Socket %d connection failed", socket_id);
-		modem_cmd_handler_set_error(data, -ECONNREFUSED);
+	int socket_id = atoi(argv[0]);
+	char *status = argv[1];
+
+	/* strip leading whitespace */
+	while (*status == ' ') {
+		status++;
 	}
 
-	// k_sem_give(&mdata.sockets[socket_id].tx_sem);
-	k_sem_give(&mdata.sem_dns);
+	if (strcmp(status, "CONNECT OK") == 0) {
+		modem_cmd_handler_set_error(data, 0);
+	} else if (strcmp(status, "CONNECT FAIL") == 0) {
+		modem_cmd_handler_set_error(data, -ECONNREFUSED);
+	} else {
+		return -ENOMSG; /* not our URC */
+	}
+
+	k_sem_give(&mdata.sem_sock_conn);
+	return 0;
+}
+
+/* Response format: <socket_id>, "CLOSE OK" or "CLOSE FAIL" */
+MODEM_CMD_DEFINE(on_cmd_cipclose)
+{
+	if (argc < 2) {
+		return -EINVAL;
+	}
+
+	int socket_id = atoi(argv[0]);
+	char *status = argv[1];
+
+	/* strip leading whitespace */
+	while (*status == ' ') {
+		status++;
+	}
+
+	if (strcmp(status, "CLOSE OK") == 0) {
+		modem_cmd_handler_set_error(data, 0);
+	} else if (strcmp(status, "CLOSE FAIL") == 0) {
+		modem_cmd_handler_set_error(data, -EIO);
+	} else {
+		return -ENOMSG; /* not our URC */
+	}
+
+	k_sem_give(&mdata.sem_response);
 	return 0;
 }
 
@@ -131,7 +154,7 @@ MODEM_CMD_DEFINE(on_cmd_cipsend_ok)
 {
 	int socket_id = (argc > 0) ? atoi(argv[0]) : 0;
 
-	LOG_INF("Socket %d: SEND OK", socket_id);
+	LOG_DBG("Socket %d: SEND OK", socket_id);
 	modem_cmd_handler_set_error(data, 0);
 	k_sem_give(&mdata.sem_response);
 	return 0;
@@ -147,6 +170,24 @@ MODEM_CMD_DEFINE(on_cmd_cipsend_fail)
 	return 0;
 }
 
+static int get_inx_form_fd(struct modem_socket_config *cfg, int sock_fd)
+{
+	int i;
+
+	k_sem_take(&cfg->sem_lock, K_FOREVER);
+
+	for (i = 0; i < cfg->sockets_len; i++) {
+		if (cfg->sockets[i].sock_fd == sock_fd) {
+			k_sem_give(&cfg->sem_lock);
+			return i;
+		}
+	}
+
+	k_sem_give(&cfg->sem_lock);
+
+	return -EINVAL;
+}
+
 int modem_offload_socket(int family, int type, int proto)
 {
 	int ret;
@@ -157,6 +198,22 @@ int modem_offload_socket(int family, int type, int proto)
 		return -1;
 	}
 
+	struct modem_socket *sock = modem_socket_from_fd(&mdata.socket_config, ret);
+
+	int i = get_inx_form_fd(&mdata.socket_config, ret);
+
+	if (i < 0) {
+		LOG_ERR("Failed to get socket index from fd %d", ret);
+		modem_socket_put(&mdata.socket_config, ret);
+		errno = EINVAL;
+		return -1;
+	}
+
+	struct sim800l_socket_data *sock_data = &mdata.socket_data[i];
+	/* Initialize socket data and connecting socket with socket_data*/
+	memset(sock_data, 0, sizeof(*sock_data));
+	sock->data = sock_data;
+
 	errno = 0;
 	LOG_INF("Created socket: %d", ret);
 	return ret;
@@ -166,22 +223,44 @@ static int offload_close(void *obj)
 {
 	struct modem_socket *sock = (struct modem_socket *)obj;
 	int ret;
+	char buf[32];
+
+	static const struct modem_cmd cmd[] = {
+		MODEM_CMD("", on_cmd_cipclose, 2U, ","),
+	};
 
 	if (!sock) {
 		errno = EBADF;
 		return -1;
 	}
 
-	LOG_INF("Closing socket %d", sock->sock_fd);
+	LOG_DBG("Closing socket %d", sock->sock_fd);
 
 	/* If socket is connected, send AT+CIPCLOSE to close connection */
 	if (sock->is_connected) {
-		ret = modem_cmd_send(&mdata.ctx.iface, &mdata.ctx.cmd_handler, NULL, 0U,
-				     "AT+CIPCLOSE", &mdata.sem_response, MDM_CMD_TIMEOUT);
-		if (ret < 0) {
+		/* AT+CIPCLOSE=<n>,<socket_id>
+		 * <n> 0 - Slow close, 1 - Quick close
+		 */
+		snprintf(buf, sizeof(buf), "AT+CIPCLOSE=%d", sock->id - MDM_BASE_SOCKET_NUM);
+		ret = modem_cmd_send(&mdata.ctx.iface, &mdata.ctx.cmd_handler, cmd, ARRAY_SIZE(cmd),
+				     buf, &mdata.sem_response, MDM_CMD_TIMEOUT);
+		if (ret < 0 || modem_cmd_handler_get_error(&mdata.cmd_handler_data) != 0) {
 			LOG_WRN("Failed to close connection: %d", ret);
 		}
 		sock->is_connected = false;
+	}
+
+	/* Clear any buffered data */
+	struct sim800l_socket_data *sock_data = sock->data;
+
+	if (sock_data) {
+		k_mutex_lock(&sock_data->lock, K_FOREVER);
+		if (sock_data->rx_buf) {
+			net_buf_unref(sock_data->rx_buf);
+			sock_data->rx_buf = NULL;
+		}
+		sock_data->buffered = 0;
+		k_mutex_unlock(&sock_data->lock);
 	}
 
 	/* Put socket back to pool */
@@ -199,6 +278,10 @@ static int offload_connect(void *obj, const struct sockaddr *addr, socklen_t add
 	uint16_t port;
 	const char *proto;
 	int ret;
+
+	static const struct modem_cmd cmd[] = {
+		MODEM_CMD("", on_cmd_cipstart, 2U, ","),
+	};
 
 	if (!addr) {
 		errno = EINVAL;
@@ -251,15 +334,37 @@ static int offload_connect(void *obj, const struct sockaddr *addr, socklen_t add
 	snprintf(buf, sizeof(buf), "AT+CIPSTART=%d,\"%s\",\"%s\",%u", sock->id, proto, ip_str,
 		 port);
 
-	const struct modem_cmd cipstart_cmd[] = {
-		MODEM_CMD("", on_cmd_cipstart, 0U, ""),
-	};
+	k_sem_reset(&mdata.sem_sock_conn);
+
 	/* Send connect command */
-	ret = modem_cmd_send(&mdata.ctx.iface, &mdata.ctx.cmd_handler, cipstart_cmd,
-			     ARRAY_SIZE(cipstart_cmd), buf, &mdata.sem_dns, K_SECONDS(30));
+	ret = modem_cmd_send(&mdata.ctx.iface, &mdata.ctx.cmd_handler, NULL, 0U, buf,
+			     &mdata.sem_response, K_SECONDS(1));
 
 	if (ret < 0) {
 		LOG_ERR("Failed to connect: %d", ret);
+		errno = -ret;
+		return -1;
+	}
+
+	/* set command handlers */
+	ret = modem_cmd_handler_update_cmds(&mdata.cmd_handler_data, cmd, ARRAY_SIZE(cmd), true);
+	if (ret < 0) {
+		LOG_ERR("Failed to set command handlers: %d", ret);
+		errno = -ret;
+		return -1;
+	}
+
+	/* Wait for CONNECT OK/CONNECT FAIL */
+	ret = k_sem_take(&mdata.sem_sock_conn, MDM_CONN_TIMEOUT);
+	if (ret < 0) {
+		LOG_ERR("Socket connect timeout");
+		errno = ETIMEDOUT;
+		return -1;
+	}
+
+	ret = modem_cmd_handler_get_error(&mdata.cmd_handler_data);
+	if (ret != 0) {
+		LOG_ERR("Socket connect failed: %d", ret);
 		errno = -ret;
 		return -1;
 	}
@@ -295,6 +400,7 @@ static ssize_t offload_sendto(void *obj, const void *buf, size_t len, int flags,
 	char ctrlz = 0x1A; /* Ctrl+Z character to indicate end of data */
 	char cmd[32];
 	int ret;
+
 	/* Only need to catch the '>' prompt - send confirmation handlers are in unsolicited array
 	 */
 	struct modem_cmd handler_cmds[] = {
@@ -337,6 +443,8 @@ static ssize_t offload_sendto(void *obj, const void *buf, size_t len, int flags,
 	snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%d,%zu", sock->id, len);
 
 	/* Reset semaphore before sending */
+	k_sem_take(&mdata.cmd_handler_data.sem_tx_lock, K_FOREVER);
+	/* '>' will give semaphore */
 	k_sem_reset(&mdata.sem_tx_ready);
 
 	ret = modem_cmd_send_nolock(&mdata.ctx.iface, &mdata.ctx.cmd_handler, NULL, 0U, cmd, NULL,
@@ -357,11 +465,8 @@ static ssize_t offload_sendto(void *obj, const void *buf, size_t len, int flags,
 		return -1;
 	}
 
-	/* Wait for 'SEND OK' or 'SEND FAIL' */
-	k_sem_reset(&mdata.sem_response);
-
 	/* Wait for '>' */
-	ret = k_sem_take(&mdata.sem_tx_ready, K_MSEC(5000));
+	ret = k_sem_take(&mdata.sem_tx_ready, K_SECONDS(2));
 	if (ret < 0) {
 		/* Didn't get the data prompt - Exit. */
 		LOG_DBG("Timeout waiting for tx");
@@ -373,7 +478,15 @@ static ssize_t offload_sendto(void *obj, const void *buf, size_t len, int flags,
 	modem_cmd_send_data_nolock(&mdata.ctx.iface, buf, len);
 	modem_cmd_send_data_nolock(&mdata.ctx.iface, &ctrlz, 1);
 
+	/* Wait for 'SEND OK' or 'SEND FAIL' */
+	k_sem_reset(&mdata.sem_response);
 	ret = k_sem_take(&mdata.sem_response, MDM_CMD_TIMEOUT);
+
+	/* Clean up */
+	modem_cmd_handler_update_cmds(&mdata.cmd_handler_data, NULL, 0U, false);
+
+	k_sem_give(&mdata.cmd_handler_data.sem_tx_lock);
+
 	if (ret < 0) {
 		LOG_ERR("Timeout waiting for send confirmation");
 		errno = ETIMEDOUT;
@@ -395,10 +508,102 @@ static ssize_t offload_recvfrom(void *obj, void *buf, size_t max_len, int flags,
 				struct sockaddr *src_addr, socklen_t *addrlen)
 {
 	struct modem_socket *sock = (struct modem_socket *)obj;
+	size_t total_read = 0;
+	int ret;
 
-	LOG_WRN("recvfrom not yet implemented for socket %d", sock->sock_fd);
-	errno = ENOTSUP;
-	return -1;
+	if (!sock || !buf || max_len == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (flags & ZSOCK_MSG_PEEK) {
+		errno = ENOTSUP;
+		return -1;
+	}
+
+	if (flags & ~(ZSOCK_MSG_DONTWAIT)) {
+		errno = ENOTSUP;
+		return -1;
+	}
+
+	if (!(flags & ZSOCK_MSG_DONTWAIT)) {
+		modem_socket_wait_data(&mdata.socket_config, sock);
+	}
+
+	uint16_t available = modem_socket_next_packet_size(&mdata.socket_config, sock);
+
+	if (available == 0U) {
+		if (flags & ZSOCK_MSG_DONTWAIT) {
+			errno = EAGAIN;
+			return -1;
+		}
+
+		/* No data yet even after waiting. */
+		errno = EAGAIN;
+		return -1;
+	}
+
+	size_t to_read = MIN((size_t)available, max_len);
+
+	struct sim800l_socket_data *sock_data = sock->data;
+	if (!sock_data) {
+		LOG_ERR("Socket data not initialized for fd %d", sock->sock_fd);
+		errno = EIO;
+		return -1;
+	}
+
+	k_mutex_lock(&sock_data->lock, K_FOREVER);
+
+	if (!sock_data->rx_buf || sock_data->buffered == 0) {
+		k_mutex_unlock(&sock_data->lock);
+		LOG_DBG("No buffered payload for socket %d", sock->sock_fd);
+		errno = EAGAIN;
+		return -1;
+	}
+
+	LOG_DBG("Will read %zu bytes from socket %d", to_read, sock->sock_fd);
+	size_t copied = net_buf_linearize(buf, to_read, sock_data->rx_buf, 0, to_read);
+	if (copied < to_read) {
+		k_mutex_unlock(&sock_data->lock);
+		errno = EIO;
+		return -1;
+	}
+
+	total_read = copied;
+	net_buf_pull(sock_data->rx_buf, total_read);
+	if (sock_data->buffered >= total_read) {
+		sock_data->buffered -= total_read;
+	} else {
+		sock_data->buffered = 0;
+	}
+
+	if (sock_data->rx_buf->len == 0 && sock_data->rx_buf->frags == NULL) {
+		net_buf_unref(sock_data->rx_buf);
+		sock_data->rx_buf = NULL;
+	}
+
+	ret = modem_socket_packet_size_update(&mdata.socket_config, sock, -(int)total_read);
+	if (ret < 0) {
+		LOG_WRN("Failed to update packet size for socket %d: %d", sock->id, ret);
+	}
+
+	k_mutex_unlock(&sock_data->lock);
+
+	if (src_addr && addrlen) {
+		size_t copy_len = MIN((size_t)*addrlen, sizeof(sock->dst));
+
+		memcpy(src_addr, &sock->dst, copy_len);
+		*addrlen = (socklen_t)copy_len;
+	}
+
+	if (modem_socket_next_packet_size(&mdata.socket_config, sock) > 0) {
+		/* More data pending; let waiting readers know. */
+		modem_socket_data_ready(&mdata.socket_config, sock);
+	}
+
+	LOG_DBG("Received %zu bytes on socket %d", total_read, sock->sock_fd);
+	errno = 0;
+	return (ssize_t)total_read;
 }
 
 static ssize_t offload_read(void *obj, void *buf, size_t max_len)
