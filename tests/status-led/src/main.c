@@ -50,7 +50,7 @@ static void test_setup(void)
 	}
 	for (int i = 0; i < 2; i++) {
 
-		ret = z_status_led_set_state(status_led_dev[i], STATUS_LED_OFF);
+		ret = status_led_set_state(status_led_dev[i], STATUS_LED_OFF);
 		if (ret != 0) {
 			printk("ERROR: Failed to turn off LED %d (ret=%d)\n", i, ret);
 			return;
@@ -83,7 +83,7 @@ int test_status_led_simple_cycle(void)
 
 			printk("Testing LED %d state: %s\n", i, test_state_names[j]);
 
-			ret = z_status_led_set_state(status_led_dev[i], state);
+			ret = status_led_set_state(status_led_dev[i], state);
 			if (ret != 0) {
 				printk("ERROR: Failed to set LED %d state %d (ret=%d)\n", i, state,
 				       ret);

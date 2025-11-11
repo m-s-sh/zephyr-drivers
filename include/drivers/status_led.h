@@ -49,7 +49,7 @@ struct status_led_driver_api {
  * @param state LED state to set
  * @return 0 on success, negative error code on failure
  */
-static inline int z_status_led_set_state(const struct device *dev, enum status_led_state state)
+static inline int status_led_set_state(const struct device *dev, enum status_led_state state)
 {
 	const struct status_led_driver_api *api = dev->api;
 
@@ -67,7 +67,7 @@ static inline int z_status_led_set_state(const struct device *dev, enum status_l
  * @param color LED color to query
  * @return Current LED state
  */
-static inline enum status_led_state z_status_led_get_state(const struct device *dev)
+static inline enum status_led_state status_led_get_state(const struct device *dev)
 {
 	const struct status_led_driver_api *api = dev->api;
 

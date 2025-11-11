@@ -165,13 +165,13 @@ if (!device_is_ready(led_dev)) {
 }
 
 /* Set LED states */
-z_status_led_set_state(led_dev, STATUS_LED_ON);           // Solid on
-z_status_led_set_state(led_dev, STATUS_LED_BLINK_FAST);   // Fast blink
-z_status_led_set_state(led_dev, STATUS_LED_HEARTBEAT);    // Heartbeat pattern
-z_status_led_set_state(led_dev, STATUS_LED_OFF);          // Turn off
+status_led_set_state(led_dev, STATUS_LED_ON);           // Solid on
+status_led_set_state(led_dev, STATUS_LED_BLINK_FAST);   // Fast blink
+status_led_set_state(led_dev, STATUS_LED_HEARTBEAT);    // Heartbeat pattern
+status_led_set_state(led_dev, STATUS_LED_OFF);          // Turn off
 
-/* Get current state */
-enum status_led_state current = z_status_led_get_state(led_dev);
+// Get current state
+enum status_led_state current = status_led_get_state(led_dev);
 ```
 
 ### SIM800L Modem Driver
@@ -210,8 +210,8 @@ close(sock);
 
 **Functions:**
 
-- `z_status_led_set_state(dev, state)` - Set LED to specified state
-- `z_status_led_get_state(dev)` - Get current LED state
+- `status_led_set_state(dev, state)` - Set LED to specified state
+- `status_led_get_state(dev)` - Get current LED state
 
 **States:**
 
