@@ -29,7 +29,7 @@ struct status_led_data {
 	uint32_t heartbeat_counter;
 };
 
-static int status_led_set_state(const struct device *dev, enum status_led_state state)
+static int status_led_set_state_impl(const struct device *dev, enum status_led_state state)
 {
 	const struct status_led_config *config = dev->config;
 	struct status_led_data *data = dev->data;
@@ -61,7 +61,7 @@ static int status_led_set_state(const struct device *dev, enum status_led_state 
 	return 0;
 }
 
-static enum status_led_state status_led_get_state(const struct device *dev)
+static enum status_led_state status_led_get_state_impl(const struct device *dev)
 {
 	struct status_led_data *data = dev->data;
 
@@ -150,8 +150,8 @@ static int status_led_init(const struct device *dev)
 }
 
 static const struct status_led_driver_api status_led_api = {
-	.get_state = status_led_get_state,
-	.set_state = status_led_set_state,
+	.get_state = status_led_get_state_impl,
+	.set_state = status_led_set_state_impl,
 };
 
 #define STATUS_LED_DEFINE(i)                                                                       \
