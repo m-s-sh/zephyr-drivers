@@ -210,8 +210,9 @@ int modem_offload_socket(int family, int type, int proto)
 	}
 
 	struct sim800l_socket_data *sock_data = &mdata.socket_data[i];
-	/* Initialize socket data and connecting socket with socket_data*/
+
 	memset(sock_data, 0, sizeof(*sock_data));
+	k_mutex_init(&sock_data->lock);
 	sock->data = sock_data;
 
 	errno = 0;
@@ -234,7 +235,8 @@ static int offload_close(void *obj)
 		return -1;
 	}
 
-	LOG_DBG("Closing socket %d", sock->sock_fd);
+	LOG_WRN("offload_close called on socket %d (modem ID: %d), is_connected=%d", sock->sock_fd,
+		sock->id, sock->is_connected);
 
 	/* If socket is connected, send AT+CIPCLOSE to close connection */
 	if (sock->is_connected) {
@@ -533,19 +535,13 @@ static ssize_t offload_recvfrom(void *obj, void *buf, size_t max_len, int flags,
 	uint16_t available = modem_socket_next_packet_size(&mdata.socket_config, sock);
 
 	if (available == 0U) {
-		if (flags & ZSOCK_MSG_DONTWAIT) {
-			errno = EAGAIN;
-			return -1;
-		}
-
-		/* No data yet even after waiting. */
 		errno = EAGAIN;
 		return -1;
 	}
 
 	size_t to_read = MIN((size_t)available, max_len);
-
 	struct sim800l_socket_data *sock_data = sock->data;
+
 	if (!sock_data) {
 		LOG_ERR("Socket data not initialized for fd %d", sock->sock_fd);
 		errno = EIO;
@@ -556,13 +552,18 @@ static ssize_t offload_recvfrom(void *obj, void *buf, size_t max_len, int flags,
 
 	if (!sock_data->rx_buf || sock_data->buffered == 0) {
 		k_mutex_unlock(&sock_data->lock);
-		LOG_DBG("No buffered payload for socket %d", sock->sock_fd);
+		LOG_DBG("No buffered data for socket %d (modem ID: %d)", sock->sock_fd, sock->id);
 		errno = EAGAIN;
 		return -1;
 	}
 
-	LOG_DBG("Will read %zu bytes from socket %d", to_read, sock->sock_fd);
+	LOG_DBG("Reading %zu bytes from socket %d (modem ID: %d)", to_read, sock->sock_fd,
+		sock->id);
+
 	size_t copied = net_buf_linearize(buf, to_read, sock_data->rx_buf, 0, to_read);
+
+	LOG_HEXDUMP_DBG(buf, copied, "Received data:");
+
 	if (copied < to_read) {
 		k_mutex_unlock(&sock_data->lock);
 		errno = EIO;
@@ -597,11 +598,12 @@ static ssize_t offload_recvfrom(void *obj, void *buf, size_t max_len, int flags,
 	}
 
 	if (modem_socket_next_packet_size(&mdata.socket_config, sock) > 0) {
-		/* More data pending; let waiting readers know. */
+		/* More data pending */
 		modem_socket_data_ready(&mdata.socket_config, sock);
 	}
 
-	LOG_DBG("Received %zu bytes on socket %d", total_read, sock->sock_fd);
+	LOG_DBG("Received %zu bytes on socket %d (modem ID: %d)", total_read, sock->sock_fd,
+		sock->id);
 	errno = 0;
 	return (ssize_t)total_read;
 }
@@ -611,6 +613,63 @@ static ssize_t offload_read(void *obj, void *buf, size_t max_len)
 	/* Simply call recvfrom with NULL address parameters and no flags */
 	return offload_recvfrom(obj, buf, max_len, 0, NULL, NULL);
 }
+
+static ssize_t offload_sendmsg(void *obj, const struct msghdr *msg, int flags)
+{
+	struct modem_socket *sock = (struct modem_socket *)obj;
+	size_t total_len = 0;
+	size_t sent = 0;
+	int ret;
+
+	if (!sock || !msg) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	/* Calculate total message length */
+	for (size_t i = 0; i < msg->msg_iovlen; i++) {
+		total_len += msg->msg_iov[i].iov_len;
+	}
+
+	if (total_len == 0) {
+		return 0;
+	}
+
+	/* If only one iov, send directly */
+	if (msg->msg_iovlen == 1) {
+		return offload_sendto(obj, msg->msg_iov[0].iov_base, msg->msg_iov[0].iov_len, flags,
+				      msg->msg_name, msg->msg_namelen);
+	}
+
+	/* Multiple iovs - need to send each one */
+	for (size_t i = 0; i < msg->msg_iovlen; i++) {
+		if (msg->msg_iov[i].iov_len == 0) {
+			continue;
+		}
+
+		ret = offload_sendto(obj, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len, flags,
+				     (i == 0) ? msg->msg_name : NULL,
+				     (i == 0) ? msg->msg_namelen : 0);
+
+		if (ret < 0) {
+			if (sent > 0) {
+				/* Some data was sent before error */
+				return sent;
+			}
+			return ret;
+		}
+
+		sent += ret;
+
+		/* If partial send, stop here */
+		if ((size_t)ret < msg->msg_iov[i].iov_len) {
+			return sent;
+		}
+	}
+
+	return sent;
+}
+
 /*
  * Perform a dns lookup.
  */
@@ -699,6 +758,16 @@ const struct socket_dns_offload offload_dns_ops = {
 	.freeaddrinfo = offload_freeaddrinfo,
 };
 
+static int offload_ioctl(void *obj, unsigned int request, va_list args)
+{
+	ARG_UNUSED(obj);
+	ARG_UNUSED(request);
+	ARG_UNUSED(args);
+
+	errno = ENOTSUP;
+	return 0;
+}
+
 bool modem_offload_is_supported(int family, int type, int proto)
 {
 	if (family != AF_INET && family != AF_INET6) {
@@ -751,7 +820,7 @@ const struct socket_op_vtable offload_socket_fd_op_vtable = {
 			.read = offload_read,
 			.write = offload_write,
 			.close = offload_close,
-			.ioctl = NULL,
+			.ioctl = offload_ioctl,
 		},
 	.bind = NULL,
 	.connect = offload_connect,
@@ -759,7 +828,7 @@ const struct socket_op_vtable offload_socket_fd_op_vtable = {
 	.recvfrom = offload_recvfrom,
 	.listen = NULL,
 	.accept = NULL,
-	.sendmsg = NULL,
+	.sendmsg = offload_sendmsg,
 	.getsockopt = NULL,
 	.setsockopt = NULL,
 };

@@ -273,9 +273,7 @@ MODEM_CMD_DEFINE(on_urc_receive)
 		LOG_WRN("Received data for unknown socket %d", sock_id);
 		return 0;
 	}
-	// 1. read any data after +RECEIVE,<n>,<data length> from rx_buf skip :\r\n
-	// 2. read additional data from uart till the data_len is reached
-	// 3. append all read data to
+
 	struct sim800l_socket_data *sock_data = (struct sim800l_socket_data *)sock->data;
 
 	k_mutex_lock(&sock_data->lock, K_FOREVER);
@@ -288,76 +286,57 @@ MODEM_CMD_DEFINE(on_urc_receive)
 			return 0;
 		}
 	}
-	/* Read remaining data from data->rx_buf buffer.
-	 * The buffer contains: <data_length>:\r\n<partial_payload>
-	 * We need to find ':', skip ':\r\n', then copy the payload.
-	 */
 
-	/* Search for ':' marker in the buffer and skip everything up to and including :\r\n */
-	bool found_colon = false;
+	LOG_DBG("rx_buf has %d bytes before header skip", data->rx_buf ? data->rx_buf->len : 0);
 
-	while (data->rx_buf->len > 0 && !found_colon) {
-		/* Check if current byte is ':' */
-		uint8_t byte = net_buf_pull_u8(data->rx_buf);
+	/* Read remaining data from UART with retry logic */
+	int retry_count = 0;
+	const int max_retries = 5;
+	int skip = 1;
 
-		if (byte == ':') {
-			found_colon = true;
-			/* Now skip \r\n (2 more bytes) */
-			size_t crlf_to_skip = MIN((size_t)2, data->rx_buf->len);
-			net_buf_pull(data->rx_buf, crlf_to_skip);
-			break;
-		}
-
-		/* Not the colon yet, skip this byte */
-		net_buf_pull_u8(data->rx_buf);
-	}
-
-	/* Now copy payload data from rx_buf to socket buffer */
-	while (data_len > 0 && data->rx_buf->len > 0) {
-		size_t to_copy = MIN((size_t)data_len, data->rx_buf->len);
-
-		if (net_buf_tailroom(sock_data->rx_buf) < to_copy) {
-			LOG_ERR("Socket %d RX buffer overflow", sock_id);
-			break;
-		}
-
-		net_buf_add_mem(sock_data->rx_buf, data->rx_buf->data, to_copy);
-		net_buf_pull(data->rx_buf, to_copy);
-		sock_data->buffered += to_copy;
-		data_len -= to_copy;
-	}
-
-	/* Read available data from UART to the socket RX buffer */
 	while (data_len > 0) {
-		size_t to_read = MIN(data_len, sizeof(chunk));
+		size_t to_read = MIN(data_len + skip, sizeof(chunk));
 		size_t bytes_read;
 
 		ret = mdata.ctx.iface.read(&mdata.ctx.iface, chunk, to_read, &bytes_read);
-		LOG_DBG("Socket %d read %d bytes", sock_id, bytes_read);
 		if (ret < 0) {
 			LOG_ERR("Socket %d read error: %d", sock_id, ret);
 			break;
 		}
+
 		if (bytes_read == 0) {
-			/* No more data available */
-			break;
+			/* Data may still be arriving at 9600 baud */
+			if (retry_count < max_retries) {
+				retry_count++;
+				k_sleep(K_MSEC(10));
+				continue;
+			} else {
+				LOG_WRN("Socket %d no more data after %d retries", sock_id,
+					max_retries);
+				break;
+			}
 		}
+
+		/* Got data - reset retry counter */
+		retry_count = 0;
 
 		/* Append to socket RX buffer */
 		if (net_buf_tailroom(sock_data->rx_buf) < bytes_read) {
 			LOG_ERR("Socket %d RX buffer overflow", sock_id);
 			break;
 		}
-		net_buf_add_mem(sock_data->rx_buf, chunk, bytes_read);
-		sock_data->buffered += bytes_read;
-		data_len -= bytes_read;
+		LOG_HEXDUMP_DBG(chunk, bytes_read, "Received chunk:");
+		net_buf_add_mem(sock_data->rx_buf, chunk + skip, bytes_read - skip);
+		sock_data->buffered += bytes_read - skip;
+		data_len -= bytes_read - skip;
+		skip = 0;
 	}
 
 	k_mutex_unlock(&sock_data->lock);
 
-	LOG_DBG("Socket %d total buffered data: %d bytes", sock_id, sock_data->buffered);
+	LOG_DBG("Socket %d buffered %zu bytes", sock_id, sock_data->buffered);
 	if (sock_data->buffered > 0) {
-		/* Update socket packet size to reflect available data */
+		/* Signal data is ready */
 		modem_socket_packet_size_update(&mdata.socket_config, sock, sock_data->buffered);
 		modem_socket_data_ready(&mdata.socket_config, sock);
 	}
@@ -694,15 +673,6 @@ static int modem_init(const struct device *dev)
 				MDM_BASE_SOCKET_NUM, true, &offload_socket_fd_op_vtable);
 	if (ret < 0) {
 		return ret;
-	}
-
-	for (int i = 0; i < MDM_MAX_SOCKETS; i++) {
-		struct sim800l_socket_data *sock_data = &mdata.socket_data[i];
-
-		sock_data->rx_buf = NULL;
-		sock_data->buffered = 0;
-		k_mutex_init(&sock_data->lock);
-		mdata.sockets[i].data = sock_data;
 	}
 
 	/* Command handler. */
