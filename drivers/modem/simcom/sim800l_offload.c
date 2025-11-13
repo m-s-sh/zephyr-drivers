@@ -114,6 +114,7 @@ MODEM_CMD_DEFINE(on_cmd_cipclose)
 	}
 
 	k_sem_give(&mdata.sem_response);
+	LOG_DBG("Socket %d closed", socket_id);
 	return 0;
 }
 
@@ -134,10 +135,6 @@ MODEM_CMD_DEFINE(on_cmd_ciprxget)
 	}
 	return 0;
 }
-
-static const struct modem_cmd response_cmds_ciprxget[] = {
-	MODEM_CMD("+CIPRXGET:", on_cmd_ciprxget, 2U, ","),
-};
 
 /*
  * Unlock the tx ready semaphore if '>' is received.
