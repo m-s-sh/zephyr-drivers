@@ -87,6 +87,7 @@ MODEM_CMD_DEFINE(on_cmd_cipstart)
 	}
 
 	k_sem_give(&mdata.sem_sock_conn);
+	LOG_DBG("Socket %d connection result: %s", socket_id, status);
 	return 0;
 }
 
@@ -115,24 +116,6 @@ MODEM_CMD_DEFINE(on_cmd_cipclose)
 
 	k_sem_give(&mdata.sem_response);
 	LOG_DBG("Socket %d closed", socket_id);
-	return 0;
-}
-
-MODEM_CMD_DEFINE(on_cmd_ciprxget)
-{
-	/* Response: +CIPRXGET: 2,<length>,<data> */
-	struct sim800l_data *d = (struct sim800l_data *)data;
-
-	if (argc >= 2) {
-		int mode = atoi(argv[0]);
-		int len = atoi(argv[1]);
-
-		if (mode == 2 && len > 0) {
-			/* Data follows, will be read by net_buf */
-			d->rx_len = len;
-			modem_cmd_handler_set_error(data, 0);
-		}
-	}
 	return 0;
 }
 
