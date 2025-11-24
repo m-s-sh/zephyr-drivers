@@ -1,0 +1,33 @@
+/*
+ * Copyright (c) 2025 Blue Vending
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+&pinctrl {
+	pio1_uart0_default: pio1_uart0_default {
+		rx_pins {
+			pinmux = <PIO1_P27>;
+			input-enable;
+			bias-pull-up;
+		};
+		tx_pins {
+			pinmux = <PIO1_P26>;
+		};
+	};
+};
+
+&pio1 {
+	status = "okay";
+
+	pio1_uart0: uart0 {
+		pinctrl-0 = <&pio1_uart0_default>;
+		pinctrl-names = "default";
+
+		compatible = "raspberrypi,pico-uart-pio-enhanced";
+		current-speed = <9600>;
+		data-bits = <9>;
+		status = "okay";
+	};
+};
+

@@ -33,6 +33,21 @@ Full-featured cellular modem driver for the SIMCOM SIM800L GSM/GPRS module with 
 - Signal strength (RSSI) monitoring
 - Power management support
 
+### Raspberry Pi Pico PIO UART Enhanced Driver
+
+A software UART driver using the RP2040 PIO, supporting configurable data bits and interrupt-driven RX with buffering.
+
+**Features:**
+
+- Configurable data bits (8/9/10/11/12/13/14/15/16)
+- RX and TX via PIO state machines
+- Device tree integration
+- Interrupt-driven RX with software buffer
+- RX interrupt enable/disable via API
+- Efficient RX FIFO draining in ISR
+- Zephyr UART API compatible (`poll_in_u16`, `poll_out_u16`, IRQ API)
+- Multiple UART instances supported
+
 ## Hardware Requirements
 
 - Raspberry Pi Pico (or compatible RP2040 board)
@@ -44,25 +59,32 @@ Full-featured cellular modem driver for the SIMCOM SIM800L GSM/GPRS module with 
 ```text
 workspace/
 ├── drivers/
-│   ├── led/              # Status LED driver
+│   ├── led/                      # Status LED driver
 │   │   ├── status_led.c
 │   │   ├── CMakeLists.txt
 │   │   └── Kconfig
-│   └── modem/simcom/     # SIM800L modem driver
-│       ├── sim800l.c
-│       ├── sim800l.h
-│       ├── sim800l_offload.c
-│       ├── sim800l_pdp.c
+│   ├── modem/simcom/             # SIM800L modem driver
+│   │   ├── sim800l.c
+│   │   ├── sim800l.h
+│   │   ├── sim800l_offload.c
+│   │   ├── sim800l_pdp.c
+│   │   ├── CMakeLists.txt
+│   │   └── Kconfig
+│   └── serial/                   # UART/PIO drivers
+│       ├── uart_rpi_pico_pio_enhanced.c
 │       ├── CMakeLists.txt
 │       └── Kconfig
-├── include/drivers/      # Driver header files
+├── include/drivers/              # Driver header files
 │   └── status_led.h
-├── dts/bindings/         # Device tree bindings
-│   └── led/
-│       └── status-led.yaml
-├── tests/                # Test applications
+├── dts/bindings/                 # Device tree bindings
+│   ├── led/
+│   │   └── status-led.yaml
+│   └── serial/
+│       └── uart-rpi-pico-pio-enhanced.yaml
+├── tests/                        # Test applications
 │   ├── status-led/
-│   └── modem/
+│   ├── modem/
+│   └── uart-pio/
 └── README.md
 ```
 
@@ -79,7 +101,6 @@ workspace/
 **Status LED Driver:**
 
 ```bash
-# Build status LED test
 west build -p auto -b rpi_pico tests/status-led
 west flash
 ```
@@ -87,8 +108,14 @@ west flash
 **SIM800L Modem Driver:**
 
 ```bash
-# Build modem test
 west build -p auto -b rpi_pico tests/modem -S uart_serial_port
+west flash
+```
+
+**RP2040 PIO UART Enhanced Driver:**
+
+```bash
+west build -p auto -b rpi_pico tests/uart-pio
 west flash
 ```
 
@@ -137,6 +164,23 @@ Configure the SIM800L modem in your device tree overlay:
 };
 ```
 
+### RP2040 PIO UART Enhanced Device Tree
+
+Add a UART node using the enhanced PIO UART driver:
+
+```dts
+&pio0 {
+    uart0: uart@0 {
+        compatible = "raspberrypi,pico-uart-pio-enhanced";
+        tx-pins = <0>;
+        rx-pins = <1>;
+        current-speed = <115200>;
+        data-bits = <9>;
+        status = "okay";
+    };
+};
+```
+
 ### Kconfig Options
 
 **SIM800L Driver:**
@@ -146,6 +190,13 @@ CONFIG_MODEM_SIM800L=y
 CONFIG_MODEM_SIM800L_LOG_LEVEL_DBG=y
 CONFIG_NET_SOCKETS_OFFLOAD=y
 CONFIG_NET_OFFLOAD=y
+```
+
+**RP2040 PIO UART Enhanced:**
+
+```kconfig
+CONFIG_UART_RPI_PICO_PIO_ENHANCED=y
+CONFIG_UART_RPI_PICO_PIO_ENHANCED_LOG_LEVEL_DBG=y
 ```
 
 ## Usage Examples
@@ -204,6 +255,30 @@ printk("Response: %s\n", buffer);
 close(sock);
 ```
 
+### RP2040 PIO UART Enhanced Driver
+
+```c
+#include <zephyr/drivers/uart.h>
+
+const struct device *uart_dev = DEVICE_DT_GET(DT_NODELABEL(uart0));
+
+if (!device_is_ready(uart_dev)) {
+    printk("UART device not ready\n");
+    return;
+}
+
+uint16_t rx_word;
+if (uart_poll_in_u16(uart_dev, &rx_word) == 0) {
+    printk("Received: 0x%04x\n", rx_word);
+}
+
+uart_poll_out_u16(uart_dev, 0x1A2B);
+
+// Enable RX interrupt
+uart_irq_rx_enable(uart_dev);
+// ... handle callback as usual ...
+```
+
 ## API Reference
 
 ### Status LED Driver
@@ -239,6 +314,21 @@ close(sock);
 - Signal strength monitoring
 - PDP context management
 
+### RP2040 PIO UART Enhanced Driver
+
+**Functions:**
+
+- `uart_poll_in_u16(dev, &word)` - Receive a word (8-16 bits)
+- `uart_poll_out_u16(dev, word)` - Send a word (8-16 bits)
+- `uart_irq_rx_enable(dev)` / `uart_irq_rx_disable(dev)` - Enable/disable RX interrupt
+- `uart_irq_callback_set(dev, cb, user_data)` - Set IRQ callback
+
+**Features:**
+
+- RX interrupt only enabled when requested
+- RX FIFO is drained in ISR and buffered in software
+- Supports multiple UART instances
+
 ## Testing
 
 **Status LED:**
@@ -252,6 +342,13 @@ The `tests/modem` directory contains a test application that demonstrates:
 - TCP socket communication
 - HTTP request/response
 - Signal strength monitoring
+
+**RP2040 PIO UART Enhanced:**
+The `tests/uart-pio` directory contains a test application that demonstrates:
+
+- Sending and receiving 8/9/10/11/12/13/14/15/16-bit words
+- RX interrupt-driven reception and buffering
+- Device tree and Kconfig configuration
 
 ## License
 

@@ -5,3 +5,4 @@ include($ENV{ZEPHYR_BASE}/cmake/modules/extensions.cmake)
 
 add_subdirectory_ifdef(CONFIG_STATUS_LED led)
 add_subdirectory_ifdef(CONFIG_MODEM_SIM800L modem)
+add_subdirectory_ifdef(CONFIG_UART_RPI_PICO_PIO_ENHANCED serial)

@@ -3,3 +3,4 @@
 
 rsource "led/Kconfig"
 rsource "modem/Kconfig"
+rsource "serial/Kconfig"

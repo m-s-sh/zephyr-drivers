@@ -1,0 +1,5 @@
+description: Raspberry Pi Pico PIO UART enhanced
+
+compatible: raspberrypi,pico-uart-pio-enhanced
+
+include: [uart-controller.yaml, "raspberrypi,pico-pio-device.yaml"]
