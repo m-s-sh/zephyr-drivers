@@ -1,5 +1,7 @@
 # Zephyr Drivers Collection
 
+<img width="1024" height="1024" alt="logo" src="https://github.com/user-attachments/assets/ad247ae4-dd0d-491e-bb02-0653d4592d0b" />
+
 A collection of reusable drivers and modules for Zephyr RTOS, designed for embedded systems.
 
 ## Overview
